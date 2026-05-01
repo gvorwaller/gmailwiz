@@ -17,6 +17,9 @@ client_secret*.json
 .env.*
 !.env.example
 
+# Local app state — token.json, state.db, future caches. Never committed.
+data/
+
 # Editor / OS
 .DS_Store
 .idea/
@@ -24,3 +27,10 @@ client_secret*.json
 
 # td local store (per-project, not portable)
 .todos/
+.sidecar/
+.sidecar-agent
+.sidecar-task
+.sidecar-pr
+.sidecar-start.sh
+.sidecar-base
+.td-root

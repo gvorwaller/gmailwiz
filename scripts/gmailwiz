@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# gmailwiz — top-level wrapper. Activates the project venv (by using its
+# interpreter directly) and forwards all args to `python -m gmailwiz`.
+#
+# Run from anywhere; cwd is set to the project root so credentials.json
+# resolves and the gmailwiz package is importable.
+
+set -euo pipefail
+
+# Resolve the project root from the script's own location so this wrapper
+# works even if the repo is moved or symlinked. (BASH_SOURCE works under
+# both `bash` and `zsh -i`; we run via `#!/usr/bin/env bash`.)
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV_PY="${PROJECT_ROOT}/.venv/bin/python"
+
+if [[ ! -x "${VENV_PY}" ]]; then
+  echo "gmailwiz: venv interpreter not found at ${VENV_PY}" >&2
+  echo "Did the .venv get nuked? Re-create with: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt" >&2
+  exit 1
+fi
+
+cd "${PROJECT_ROOT}"
+exec "${VENV_PY}" -m gmailwiz "$@"
