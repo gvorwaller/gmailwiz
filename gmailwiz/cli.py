@@ -590,7 +590,14 @@ def _run_label_commit(
     # OAuth — a typo'd `--run-id` shouldn't force a needless token
     # refresh (and a possible browser flow if the token is expired).
     with gw_db.open_db() as conn:
-        run = gw_db.get_run(conn, run_id)
+        # Auto-heal a stale runs.status before reading. Covers the
+        # rare-but-real case where a prior apply's `update_run_status`
+        # write failed AFTER Gmail mutations had been recorded as
+        # terminal in audit_log — without heal, the run row would stay
+        # `planned` and lock the user out of both retry (helper short-
+        # circuits on no-planned-rows) AND undo (rejects non-terminal
+        # status). Audit log is the source of truth.
+        run = planning.heal_run_status_from_audit_log(conn, run_id)
         if run is None:
             click.echo(f"No run with id {run_id!r}.", err=True)
             return 2
@@ -604,6 +611,27 @@ def _run_label_commit(
             click.echo(
                 f"Run {run_id!r} has status={run.get('status')!r}; only "
                 "'planned' runs can be applied.",
+                err=True,
+            )
+            return 2
+        # Defense-in-depth pre-OAuth UNKNOWN refusal: `apply_label_plan`
+        # rejects non-classifiable category runs, but doing it BEFORE
+        # `gw_auth.get_credentials` saves a needless token refresh on
+        # corrupted DB rows.
+        raw_category = run.get("category_filter")
+        try:
+            cat = Category(raw_category or "")
+        except ValueError:
+            click.echo(
+                f"Run {run_id!r} category_filter {raw_category!r} is not a "
+                "valid Category — cannot apply.",
+                err=True,
+            )
+            return 2
+        if cat not in CLASSIFIABLE_CATEGORIES:
+            click.echo(
+                f"Run {run_id!r} has non-classifiable category "
+                f"{cat.value!r}; cannot apply a label run for UNKNOWN.",
                 err=True,
             )
             return 2
@@ -725,6 +753,563 @@ def _run_label_commit(
     if result.run_status == "partially_failed":
         return 4
     return 5
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — archive plan / commit
+# ---------------------------------------------------------------------------
+
+
+def _print_archive_plan_preview(
+    plan: planning.ArchivePlan, *, output_json: bool
+) -> None:
+    """Render a built `ArchivePlan` for the user. JSON or table form."""
+    if output_json:
+        payload = {
+            "run_id": plan.run_id,
+            "source_run_id": plan.source_run_id,
+            "category": plan.source_category.value,
+            "fetched_message_count": plan.fetched_message_count,
+            "fetch_failure_count": plan.fetch_failure_count,
+            "candidates": [
+                {
+                    "message_id": c.message_id,
+                    "thread_id": c.thread_id,
+                    "sender_email": c.sender_email,
+                    "subject": c.subject,
+                    "before_label_ids": c.before_label_ids,
+                    "after_label_ids": c.after_label_ids,
+                }
+                for c in plan.candidates
+            ],
+            "skipped": {
+                "already_archived": plan.skipped_already_archived,
+                "source_failed": plan.skipped_source_failed,
+            },
+        }
+        click.echo(_json.dumps(payload, indent=2))
+        return
+
+    click.echo("")
+    click.echo(
+        f"Plan: archive (remove INBOX from) {len(plan.candidates)} message(s) "
+        f"from label run {plan.source_run_id} ({plan.source_category.value})."
+    )
+    click.echo(f"Archive run id: {plan.run_id}")
+    click.echo("")
+
+    if plan.candidates:
+        sender_w = min(
+            40,
+            max(len("SENDER"), max(len(c.sender_email) for c in plan.candidates)),
+        )
+        msgid_w = max(
+            len("MESSAGE ID"), max(len(c.message_id) for c in plan.candidates)
+        )
+        click.echo(f"{'MESSAGE ID':<{msgid_w}}  {'SENDER':<{sender_w}}  SUBJECT")
+        for c in plan.candidates:
+            subj = c.subject if len(c.subject) <= 60 else c.subject[:59] + "…"
+            sender_cell = (
+                c.sender_email
+                if len(c.sender_email) <= sender_w
+                else c.sender_email[: sender_w - 1] + "…"
+            )
+            click.echo(f"{c.message_id:<{msgid_w}}  {sender_cell:<{sender_w}}  {subj}")
+        click.echo("")
+
+    if plan.fetch_failure_count:
+        click.echo(
+            f"Note: {plan.fetch_failure_count} message(s) listed by the source "
+            "run could not be fetched (deleted in Gmail since labeling, or "
+            "transient API error). They will not be archived."
+        )
+        click.echo("")
+
+    if plan.total_skipped:
+        click.echo(f"Skipped {plan.total_skipped} message(s):")
+        if plan.skipped_already_archived:
+            click.echo(
+                f"  - {plan.skipped_already_archived} already archived "
+                "(no INBOX label, presumably user-archived after labeling)"
+            )
+        if plan.skipped_source_failed:
+            click.echo(
+                f"  - {plan.skipped_source_failed} from source run rows that "
+                "didn't successfully apply (failed/reverted)"
+            )
+        click.echo("")
+
+    if plan.candidates:
+        click.echo(
+            f"Apply with: gmailwiz archive --commit --run-id {plan.run_id}"
+        )
+        click.echo(
+            "(Or pick this run from the menu's "
+            "'Apply a previewed archive run' option.)"
+        )
+    else:
+        click.echo("Nothing to archive. No run to apply.")
+
+
+def _run_archive_plan(
+    *, source_run_id: str, output_json: bool
+) -> int:
+    """Build and persist an archive plan, then print the preview."""
+    # Validate the source label run BEFORE triggering OAuth — a typo'd
+    # `--from-run-id` shouldn't force a needless token refresh / browser
+    # flow. Mirrors the pattern in `_run_label_commit`,
+    # `_run_archive_commit`, and `_run_undo`.
+    with gw_db.open_db() as conn:
+        # Heal the source run's status before reading — a label run
+        # whose `update_run_status` post-apply failed would otherwise
+        # be invisible as an archive source (status='planned' fails
+        # the committed/partially_failed check).
+        source = planning.heal_run_status_from_audit_log(conn, source_run_id)
+        if source is None:
+            click.echo(f"No run with id {source_run_id!r}.", err=True)
+            return 2
+        if source.get("phase") != planning.PHASE_LABEL:
+            click.echo(
+                f"Run {source_run_id!r} has phase={source.get('phase')!r}; "
+                "archive source must be a 'label' run.",
+                err=True,
+            )
+            return 2
+        if source.get("status") not in {"committed", "partially_failed"}:
+            click.echo(
+                f"Run {source_run_id!r} has status={source.get('status')!r}; "
+                "archive source must be 'committed' or 'partially_failed'.",
+                err=True,
+            )
+            return 2
+        # Also validate the category_filter parses BEFORE OAuth — a
+        # corrupted source row would otherwise pass phase/status but
+        # fail inside `build_archive_plan` after the user has paid the
+        # OAuth round-trip cost.
+        raw_category = source.get("category_filter")
+        try:
+            cat = Category(raw_category or "")
+        except ValueError:
+            click.echo(
+                f"Run {source_run_id!r} category_filter "
+                f"{raw_category!r} is not a valid Category — cannot "
+                "use as archive source.",
+                err=True,
+            )
+            return 2
+        # Match the menu's option 6 picker filter — UNKNOWN sources
+        # never drive mutations per the Phase 2 rules. Defense-in-depth
+        # symmetric with `_run_label_commit` and `_run_undo`.
+        if cat not in CLASSIFIABLE_CATEGORIES:
+            click.echo(
+                f"Run {source_run_id!r} has non-classifiable category "
+                f"{cat.value!r}; cannot use as archive source.",
+                err=True,
+            )
+            return 2
+        # Source must have at least one applied audit row. Otherwise
+        # `build_archive_plan` would create an empty archive run row
+        # AND pay the OAuth cost. Cheap pre-check saves both. Acceptable
+        # output: rc=0 (no work to do is not a failure) with a
+        # human-readable message; in JSON mode, emit a structured shape
+        # consistent with other "nothing to do" returns.
+        applied_source_count = gw_db.count_audit_entries(
+            conn,
+            source_run_id,
+            status="applied",
+            action=planning.ACTION_ADD_LABEL,
+        )
+        if applied_source_count == 0:
+            if output_json:
+                click.echo(
+                    _json.dumps(
+                        {
+                            "run_id": None,
+                            "source_run_id": source_run_id,
+                            "candidates": [],
+                            "fetched_message_count": 0,
+                            "fetch_failure_count": 0,
+                            "skipped": {
+                                "already_archived": 0,
+                                "source_failed": 0,
+                            },
+                            "note": (
+                                "source label run has no applied audit rows — "
+                                "nothing to archive"
+                            ),
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                click.echo(
+                    f"Source label run {source_run_id} has no applied "
+                    "audit rows — nothing to archive."
+                )
+            return 0
+
+        creds = gw_auth.get_credentials()
+        _progress(
+            f"Building archive plan from label run {source_run_id}...",
+            output_json=output_json,
+        )
+        plan = planning.build_archive_plan(
+            creds=creds, conn=conn, source_run_id=source_run_id
+        )
+    _print_archive_plan_preview(plan, output_json=output_json)
+    return 0
+
+
+def _archive_commit_progress(
+    stage: str, info: dict[str, Any], *, output_json: bool
+) -> None:
+    if output_json:
+        return
+    if stage == "apply_begin":
+        click.echo(
+            f"Archiving {info['total']} message(s) (removing INBOX)...",
+            err=True,
+        )
+    elif stage == "apply_done":
+        click.echo(
+            f"  [{info['index']}/{info['total']}] archived {info['message_id']}",
+            err=True,
+        )
+    elif stage == "apply_failed":
+        click.echo(
+            f"  [{info['index']}/{info['total']}] FAILED on "
+            f"{info['message_id']}: {info['error']}",
+            err=True,
+        )
+
+
+def _run_archive_commit(
+    *, run_id: str, output_json: bool, assume_yes: bool = False
+) -> int:
+    """Apply a previously-built archive plan by run id.
+
+    Note: no UNKNOWN-category guard here (unlike `_run_label_commit` and
+    `_run_undo` for label phase). Archive operates on a fixed set of
+    `message_ids` recorded in the audit_log and removes ``INBOX`` —
+    the operation is not category-derived, so a corrupted
+    ``category_filter`` is purely informational and doesn't break apply.
+    """
+    if output_json and not assume_yes:
+        click.echo(
+            "Refusing to commit under JSON output without explicit --yes "
+            "(prompt would corrupt the JSON payload).",
+            err=True,
+        )
+        return 2
+
+    with gw_db.open_db() as conn:
+        # Auto-heal a stale runs.status before reading. Covers the
+        # rare-but-real case where a prior apply's `update_run_status`
+        # write failed AFTER Gmail mutations had been recorded as
+        # terminal in audit_log — without heal, the run row would stay
+        # `planned` and lock the user out of both retry (helper short-
+        # circuits on no-planned-rows) AND undo (rejects non-terminal
+        # status). Audit log is the source of truth.
+        run = planning.heal_run_status_from_audit_log(conn, run_id)
+        if run is None:
+            click.echo(f"No run with id {run_id!r}.", err=True)
+            return 2
+        if run.get("phase") != planning.PHASE_ARCHIVE:
+            click.echo(
+                f"Run {run_id!r} has phase={run.get('phase')!r}, expected 'archive'.",
+                err=True,
+            )
+            return 2
+        if run.get("status") != "planned":
+            click.echo(
+                f"Run {run_id!r} has status={run.get('status')!r}; only "
+                "'planned' runs can be applied.",
+                err=True,
+            )
+            return 2
+
+        planned_count = gw_db.count_audit_entries(
+            conn, run_id, status="planned", action=planning.ACTION_ARCHIVE
+        )
+        if planned_count == 0:
+            if output_json:
+                click.echo(
+                    _json.dumps(
+                        {
+                            "run_id": run_id,
+                            "applied": 0,
+                            "failed": 0,
+                            "errors": [],
+                            "run_status": "planned",
+                            "note": "no planned audit entries — nothing to do",
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                click.echo(
+                    f"Run {run_id!r} has no planned audit entries — nothing to do."
+                )
+            return 0
+
+        if not assume_yes and not output_json:
+            click.echo(
+                f"About to remove INBOX from {planned_count} message(s) in Gmail."
+            )
+            click.echo(
+                "(Messages disappear from Inbox view but stay in All Mail. "
+                "Reversible via menu option 4.)"
+            )
+            confirm = _prompt(
+                "Type 'yes' to proceed (anything else cancels): "
+            ).strip().lower()
+            if confirm != "yes":
+                click.echo("Cancelled.")
+                return 0
+
+        creds = gw_auth.get_credentials()
+        result = planning.apply_archive_plan(
+            creds=creds,
+            conn=conn,
+            run_id=run_id,
+            on_progress=lambda stage, info: _archive_commit_progress(
+                stage, info, output_json=output_json
+            ),
+        )
+
+    if output_json:
+        click.echo(
+            _json.dumps(
+                {
+                    "run_id": result.run_id,
+                    "applied": result.applied,
+                    "failed": result.failed,
+                    "errors": [
+                        {"message_id": mid, "error": err} for mid, err in result.errors
+                    ],
+                    "run_status": result.run_status,
+                },
+                indent=2,
+            )
+        )
+    else:
+        click.echo("")
+        click.echo(
+            f"Run {result.run_id}: {result.applied} archived, "
+            f"{result.failed} failed. status={result.run_status}"
+        )
+        if result.errors:
+            click.echo("Failures:")
+            for mid, err in result.errors:
+                click.echo(f"  - {mid}: {err}")
+
+    if result.run_status in {"committed", "planned"}:
+        return 0
+    if result.run_status == "partially_failed":
+        return 4
+    return 5
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 chunk 2 / Phase 3 — undo
+# ---------------------------------------------------------------------------
+
+
+def _undo_progress(
+    stage: str, info: dict[str, Any], *, output_json: bool
+) -> None:
+    if output_json:
+        return
+    if stage == "undo_begin":
+        click.echo(
+            f"Undoing {info['total']} {info['phase']} mutation(s)...",
+            err=True,
+        )
+    elif stage == "undo_done":
+        click.echo(
+            f"  [{info['index']}/{info['total']}] reverted {info['message_id']}",
+            err=True,
+        )
+    elif stage == "undo_failed":
+        click.echo(
+            f"  [{info['index']}/{info['total']}] FAILED on "
+            f"{info['message_id']}: {info['error']}",
+            err=True,
+        )
+
+
+def _run_undo(
+    *, run_id: str, output_json: bool, assume_yes: bool = False
+) -> int:
+    """Reverse a previously-applied label or archive run."""
+    if output_json and not assume_yes:
+        click.echo(
+            "Refusing to undo under JSON output without explicit --yes "
+            "(prompt would corrupt the JSON payload).",
+            err=True,
+        )
+        return 2
+
+    with gw_db.open_db() as conn:
+        # Auto-heal a stale runs.status before reading. Covers the
+        # rare-but-real case where a prior apply's `update_run_status`
+        # write failed AFTER Gmail mutations had been recorded as
+        # terminal in audit_log — without heal, the run row would stay
+        # `planned` and lock the user out of both retry (helper short-
+        # circuits on no-planned-rows) AND undo (rejects non-terminal
+        # status). Audit log is the source of truth.
+        run = planning.heal_run_status_from_audit_log(conn, run_id)
+        if run is None:
+            click.echo(f"No run with id {run_id!r}.", err=True)
+            return 2
+        if run.get("phase") not in {planning.PHASE_LABEL, planning.PHASE_ARCHIVE}:
+            click.echo(
+                f"Run {run_id!r} has phase={run.get('phase')!r}; "
+                "only label and archive runs can be undone.",
+                err=True,
+            )
+            return 2
+        if run.get("status") not in {"committed", "partially_failed"}:
+            click.echo(
+                f"Run {run_id!r} has status={run.get('status')!r}; only "
+                "'committed' and 'partially_failed' runs can be undone.",
+                err=True,
+            )
+            return 2
+        # Defense-in-depth pre-OAuth UNKNOWN refusal — only relevant
+        # for label runs (archive runs don't need a label_name lookup,
+        # so UNKNOWN is harmless there). `apply_undo_plan` rejects this
+        # too; doing it before OAuth saves a needless token refresh on
+        # corrupted DB rows.
+        if run.get("phase") == planning.PHASE_LABEL:
+            raw_category = run.get("category_filter")
+            try:
+                cat = Category(raw_category or "")
+            except ValueError:
+                click.echo(
+                    f"Run {run_id!r} category_filter {raw_category!r} is "
+                    "not a valid Category — cannot undo.",
+                    err=True,
+                )
+                return 2
+            if cat not in CLASSIFIABLE_CATEGORIES:
+                click.echo(
+                    f"Run {run_id!r} has non-classifiable category "
+                    f"{cat.value!r}; cannot undo a label run for UNKNOWN.",
+                    err=True,
+                )
+                return 2
+
+        # Count rows that will actually be reverted (action depends on phase).
+        action_filter = (
+            planning.ACTION_ADD_LABEL
+            if run.get("phase") == planning.PHASE_LABEL
+            else planning.ACTION_ARCHIVE
+        )
+        applied_count = gw_db.count_audit_entries(
+            conn, run_id, status="applied", action=action_filter
+        )
+        if applied_count == 0:
+            if output_json:
+                click.echo(
+                    _json.dumps(
+                        {
+                            "run_id": run_id,
+                            "phase": run.get("phase"),
+                            "reverted": 0,
+                            "failed": 0,
+                            "errors": [],
+                            "run_status": run.get("status"),
+                            "note": "no applied audit entries — nothing to undo",
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                click.echo(
+                    f"Run {run_id!r} has no applied audit entries — "
+                    "nothing to undo."
+                )
+            return 0
+
+        if not assume_yes and not output_json:
+            phase = run.get("phase")
+            if phase == planning.PHASE_LABEL:
+                # Resolve the label name through the canonical mapping.
+                raw_category = run.get("category_filter")
+                try:
+                    label_name = gmail_label_name(Category(raw_category or ""))
+                except ValueError:
+                    label_name = (
+                        f"gmailwiz/{raw_category}"
+                        if raw_category
+                        else "gmailwiz/<unknown>"
+                    )
+                click.echo(
+                    f"About to remove label '{label_name}' from "
+                    f"{applied_count} message(s) in Gmail."
+                )
+            else:
+                click.echo(
+                    f"About to re-add INBOX to {applied_count} previously-"
+                    "archived message(s) in Gmail."
+                )
+            confirm = _prompt(
+                "Type 'yes' to proceed (anything else cancels): "
+            ).strip().lower()
+            if confirm != "yes":
+                click.echo("Cancelled.")
+                return 0
+
+        creds = gw_auth.get_credentials()
+        result = planning.apply_undo_plan(
+            creds=creds,
+            conn=conn,
+            run_id=run_id,
+            on_progress=lambda stage, info: _undo_progress(
+                stage, info, output_json=output_json
+            ),
+        )
+
+    if output_json:
+        click.echo(
+            _json.dumps(
+                {
+                    "run_id": result.run_id,
+                    "phase": result.phase,
+                    "reverted": result.reverted,
+                    "failed": result.failed,
+                    "errors": [
+                        {"message_id": mid, "error": err} for mid, err in result.errors
+                    ],
+                    "run_status": result.run_status,
+                },
+                indent=2,
+            )
+        )
+    else:
+        click.echo("")
+        click.echo(
+            f"Run {result.run_id}: {result.reverted} reverted, "
+            f"{result.failed} failed. status={result.run_status}"
+        )
+        if result.errors:
+            click.echo("Failures:")
+            for mid, err in result.errors:
+                click.echo(f"  - {mid}: {err}")
+
+    # Exit code (mirrors apply_label_plan / apply_archive_plan):
+    #   undone (every applicable row reverted)  → 0
+    #   partial revert (some reverted, some failed)  → 4
+    #   no reverts and >=1 failure (all-failed undo)  → 5
+    #   anything else (defensive, unreachable)  → 0
+    if result.run_status == "undone":
+        return 0
+    if result.reverted == 0 and result.failed > 0:
+        return 5
+    if result.failed > 0:
+        return 4
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -892,8 +1477,16 @@ def _menu_apply_label() -> None:
         #     `Category` — apply would error out with `ValueError` mid-
         #     flight; better to hide them than to let the user pick a
         #     row that's guaranteed to fail.
+        #   * runs that auto-heal flips out of `planned` (stale-status
+        #     case where a prior apply's bookkeeping write failed). The
+        #     heal call updates the persistent state too, so the run
+        #     becomes visible to the undo picker on the next refresh.
         runs = []
         for r in all_runs:
+            healed = planning.heal_run_status_from_audit_log(conn, r["id"])
+            if healed is None or healed.get("status") != "planned":
+                continue
+            r = healed
             # Match the apply filter (status='planned' AND action='add_label')
             # so a contaminated run can't show a misleading count here.
             r["count"] = gw_db.count_audit_entries(
@@ -937,6 +1530,227 @@ def _menu_apply_label() -> None:
     except KeyboardInterrupt:
         click.echo("\nCancelled.")
     except Exception as exc:  # surface raw errors per cs.md
+        click.echo(f"Apply failed: {type(exc).__name__}: {exc}", err=True)
+
+
+def _menu_undo_run() -> None:
+    """Menu option 4: list undoable runs (label or archive), pick, confirm, undo."""
+    opt = find_option("4")
+    if opt:
+        click.echo("")
+        click.echo(opt.detail)
+        click.echo("")
+
+    with gw_db.open_db() as conn:
+        # Include `planned` in the status filter so auto-heal can rescue
+        # stale-status runs (a prior apply's bookkeeping write failed
+        # post-mutation, leaving the run row at `planned` despite real
+        # Gmail mutations). After heal, those runs flip to
+        # `committed`/`partially_failed` and become legitimate undo
+        # targets.
+        all_runs = gw_db.list_runs(
+            conn,
+            phases=(planning.PHASE_LABEL, planning.PHASE_ARCHIVE),
+            statuses=("committed", "partially_failed", "planned"),
+            limit=20,
+        )
+        runs = []
+        for r in all_runs:
+            healed = planning.heal_run_status_from_audit_log(conn, r["id"])
+            if healed is None or healed.get("status") not in {
+                "committed", "partially_failed"
+            }:
+                continue
+            r = healed
+            phase = r.get("phase")
+            action = (
+                planning.ACTION_ADD_LABEL
+                if phase == planning.PHASE_LABEL
+                else planning.ACTION_ARCHIVE
+            )
+            r["count"] = gw_db.count_audit_entries(
+                conn, r["id"], status="applied", action=action
+            )
+            if r["count"] == 0:
+                # No applied rows means there's nothing to revert.
+                continue
+            # For label runs, ensure the category is still resolvable so
+            # `apply_undo_plan` won't ValueError mid-flight.
+            if phase == planning.PHASE_LABEL:
+                try:
+                    cat = Category(r.get("category_filter") or "")
+                except ValueError:
+                    continue
+                if cat is Category.UNKNOWN:
+                    continue
+            runs.append(r)
+
+    if not runs:
+        click.echo("No previously-applied runs to undo.")
+        click.echo(
+            "(Only committed or partially-failed label / archive runs can be undone.)"
+        )
+        return
+
+    click.echo("Which run do you want to undo?")
+    for i, r in enumerate(runs, start=1):
+        phase = r.get("phase") or "?"
+        cat = r.get("category_filter") or ""
+        # Compose a tag like "label/promotional" or "archive/promotional"
+        # so the user can tell at a glance what each row represents.
+        if cat:
+            tag = f"{phase}/{cat}"
+        else:
+            tag = phase
+        # `count` is the number of currently `applied` rows (i.e., the
+        # work the undo would actually do). For a `partially_failed`
+        # run that was applied with some failures, this is the count
+        # of successful applies that remain to be reverted —
+        # disambiguate so the user doesn't read "X message(s)" as
+        # "X original mutations".
+        count_label = (
+            f"{r['count']} still applied"
+            if r["status"] == "partially_failed"
+            else f"{r['count']} message(s)"
+        )
+        click.echo(
+            f"  {i}. {_format_run_timestamp(r['created_at'])}  — "
+            f"{tag}, {count_label}, {r['status']}"
+        )
+    click.echo("  q. Cancel")
+    idx = _menu_pick_int("> ", lo=1, hi=len(runs))
+    if idx is None:
+        return
+    chosen = runs[idx - 1]
+
+    try:
+        _run_undo(run_id=chosen["id"], output_json=False, assume_yes=False)
+    except KeyboardInterrupt:
+        click.echo("\nCancelled.")
+    except Exception as exc:  # surface raw errors per cs.md
+        click.echo(f"Undo failed: {type(exc).__name__}: {exc}", err=True)
+
+
+def _menu_preview_archive() -> None:
+    """Menu option 6: pick a label run, build an archive plan, show preview."""
+    opt = find_option("6")
+    if opt:
+        click.echo("")
+        click.echo(opt.detail)
+        click.echo("")
+
+    with gw_db.open_db() as conn:
+        # Include `planned` so auto-heal can rescue stale-status label
+        # runs as legitimate archive sources.
+        all_runs = gw_db.list_runs(
+            conn,
+            phase=planning.PHASE_LABEL,
+            statuses=("committed", "partially_failed", "planned"),
+            limit=20,
+        )
+        runs = []
+        for r in all_runs:
+            healed = planning.heal_run_status_from_audit_log(conn, r["id"])
+            if healed is None or healed.get("status") not in {
+                "committed", "partially_failed"
+            }:
+                continue
+            r = healed
+            r["count"] = gw_db.count_audit_entries(
+                conn, r["id"], status="applied", action=planning.ACTION_ADD_LABEL
+            )
+            if r["count"] == 0:
+                continue
+            try:
+                cat = Category(r.get("category_filter") or "")
+            except ValueError:
+                continue
+            if cat is Category.UNKNOWN:
+                continue
+            runs.append(r)
+
+    if not runs:
+        click.echo("No applied label runs to archive from.")
+        click.echo(
+            "(Run option 2 to preview a labeling run, then option 3 to apply it. "
+            "Then come back here to archive.)"
+        )
+        return
+
+    click.echo("Pick a previously-applied label run to archive:")
+    for i, r in enumerate(runs, start=1):
+        click.echo(
+            f"  {i}. {_format_run_timestamp(r['created_at'])}  — "
+            f"label/{r.get('category_filter') or '?'}, "
+            f"{r['count']} message(s), {r['status']}"
+        )
+    click.echo("  q. Cancel")
+    idx = _menu_pick_int("> ", lo=1, hi=len(runs))
+    if idx is None:
+        return
+    chosen = runs[idx - 1]
+
+    try:
+        _run_archive_plan(source_run_id=chosen["id"], output_json=False)
+    except KeyboardInterrupt:
+        click.echo("\nCancelled.")
+    except Exception as exc:
+        click.echo(f"Archive plan failed: {type(exc).__name__}: {exc}", err=True)
+
+
+def _menu_apply_archive() -> None:
+    """Menu option 7: list planned archive runs, pick one, confirm, apply."""
+    opt = find_option("7")
+    if opt:
+        click.echo("")
+        click.echo(opt.detail)
+        click.echo("")
+
+    with gw_db.open_db() as conn:
+        all_runs = gw_db.list_runs(
+            conn, phase=planning.PHASE_ARCHIVE, status="planned", limit=20
+        )
+        runs = []
+        for r in all_runs:
+            # Heal in case a prior apply's bookkeeping write failed —
+            # if heal flips the run out of `planned`, it doesn't belong
+            # in the apply picker (it belongs in option 4 for undo).
+            healed = planning.heal_run_status_from_audit_log(conn, r["id"])
+            if healed is None or healed.get("status") != "planned":
+                continue
+            r = healed
+            r["count"] = gw_db.count_audit_entries(
+                conn, r["id"], status="planned", action=planning.ACTION_ARCHIVE
+            )
+            if r["count"] == 0:
+                continue
+            runs.append(r)
+
+    if not runs:
+        click.echo("No previewed archive runs to apply.")
+        click.echo("Use option 6 (Preview an archive run) to create one first.")
+        return
+
+    click.echo("Which previewed archive run do you want to apply?")
+    for i, r in enumerate(runs, start=1):
+        click.echo(
+            f"  {i}. {_format_run_timestamp(r['created_at'])}  — "
+            f"archive/{r.get('category_filter') or '?'}, "
+            f"{r['count']} message(s), planned"
+        )
+    click.echo("  q. Cancel")
+    idx = _menu_pick_int("> ", lo=1, hi=len(runs))
+    if idx is None:
+        return
+    chosen = runs[idx - 1]
+
+    try:
+        _run_archive_commit(
+            run_id=chosen["id"], output_json=False, assume_yes=False
+        )
+    except KeyboardInterrupt:
+        click.echo("\nCancelled.")
+    except Exception as exc:
         click.echo(f"Apply failed: {type(exc).__name__}: {exc}", err=True)
 
 
@@ -998,13 +1812,18 @@ def menu() -> None:
             _menu_preview_label()
         elif opt.key == "3":
             _menu_apply_label()
+        elif opt.key == "4":
+            _menu_undo_run()
         elif opt.key == "5":
             _menu_reauth()
+        elif opt.key == "6":
+            _menu_preview_archive()
+        elif opt.key == "7":
+            _menu_apply_archive()
         else:
             # The "q" option is handled by the early-out above, so reaching
-            # here means a Phase 3 (or future) option leaked into the menu
-            # without a dispatcher branch. Surface loudly rather than silently
-            # ignoring.
+            # here means a future option leaked into the menu without a
+            # dispatcher branch. Surface loudly rather than silently ignoring.
             click.echo(f"Option '{opt.key}' is not implemented yet.")
 
 
@@ -1139,6 +1958,12 @@ def label_cmd(
             # well-known user errors.
             click.echo(f"{type(exc).__name__}: {exc}", err=True)
             sys.exit(2)
+        except ValueError as exc:
+            click.echo(f"{exc}", err=True)
+            sys.exit(2)
+        except KeyboardInterrupt:
+            click.echo("\nCancelled.", err=True)
+            sys.exit(130)
     else:
         if not category:
             click.echo(
@@ -1164,5 +1989,183 @@ def label_cmd(
         except FileNotFoundError as exc:
             click.echo(f"{type(exc).__name__}: {exc}", err=True)
             sys.exit(2)
+        except ValueError as exc:
+            click.echo(f"{exc}", err=True)
+            sys.exit(2)
+        except KeyboardInterrupt:
+            click.echo("\nCancelled.", err=True)
+            sys.exit(130)
+    if rc != 0:
+        sys.exit(rc)
+
+
+@main.command("archive")
+@click.option(
+    "--from-run-id",
+    "source_run_id",
+    type=str,
+    default=None,
+    help="Source label run id (required for preview).",
+)
+@click.option(
+    "--commit",
+    is_flag=True,
+    default=False,
+    help="Apply a previously-previewed archive plan. Requires --run-id.",
+)
+@click.option(
+    "--run-id",
+    "run_id",
+    type=str,
+    default=None,
+    help="Run id of a previously-previewed archive plan (required with --commit).",
+)
+@click.option(
+    "--json",
+    "output_json",
+    is_flag=True,
+    default=False,
+    help="Emit JSON instead of a human-readable table.",
+)
+@click.option(
+    "--yes",
+    "assume_yes",
+    is_flag=True,
+    default=False,
+    help="Skip the 'yes' confirmation prompt at commit time.",
+)
+def archive_cmd(
+    source_run_id: Optional[str],
+    commit: bool,
+    run_id: Optional[str],
+    output_json: bool,
+    assume_yes: bool,
+) -> None:
+    """Preview or apply an archive run.
+
+    Default mode is preview (dry-run): builds a plan from a previously-applied
+    label run, persists it, prints it. No Gmail mutations occur. Apply later
+    with `--commit --run-id <archive-run-id>`.
+    """
+    if commit:
+        if not run_id:
+            click.echo("--commit requires --run-id <id>.", err=True)
+            sys.exit(2)
+        if output_json and not assume_yes:
+            click.echo(
+                "--commit with --json requires --yes (cannot prompt under "
+                "JSON output mode without corrupting the payload).",
+                err=True,
+            )
+            sys.exit(2)
+        if source_run_id:
+            click.echo(
+                "--from-run-id is ignored with --commit (the --run-id is the "
+                "previewed archive run).",
+                err=True,
+            )
+        try:
+            rc = _run_archive_commit(
+                run_id=run_id, output_json=output_json, assume_yes=assume_yes
+            )
+        except FileNotFoundError as exc:
+            click.echo(f"{type(exc).__name__}: {exc}", err=True)
+            sys.exit(2)
+        except ValueError as exc:
+            # build_archive_plan / apply_archive_plan validation errors
+            # (non-label phase, undone source, malformed category_filter,
+            # etc.). Surface as a clean rc=2 user-facing message rather
+            # than letting a Python traceback escape click.
+            click.echo(f"{exc}", err=True)
+            sys.exit(2)
+        except KeyboardInterrupt:
+            click.echo("\nCancelled.", err=True)
+            sys.exit(130)
+    else:
+        if not source_run_id:
+            click.echo(
+                "--from-run-id is required for preview mode (omit --commit, "
+                "supply --from-run-id <label-run-id>).",
+                err=True,
+            )
+            sys.exit(2)
+        if run_id:
+            click.echo(
+                "--run-id is only meaningful with --commit; ignoring.",
+                err=True,
+            )
+        if assume_yes:
+            click.echo(
+                "--yes is only meaningful with --commit; ignoring.",
+                err=True,
+            )
+        try:
+            rc = _run_archive_plan(
+                source_run_id=source_run_id, output_json=output_json
+            )
+        except FileNotFoundError as exc:
+            click.echo(f"{type(exc).__name__}: {exc}", err=True)
+            sys.exit(2)
+        except ValueError as exc:
+            click.echo(f"{exc}", err=True)
+            sys.exit(2)
+        except KeyboardInterrupt:
+            click.echo("\nCancelled.", err=True)
+            sys.exit(130)
+    if rc != 0:
+        sys.exit(rc)
+
+
+@main.command("undo")
+@click.option(
+    "--run-id",
+    "run_id",
+    type=str,
+    required=True,
+    help="Run id (label or archive) to reverse.",
+)
+@click.option(
+    "--json",
+    "output_json",
+    is_flag=True,
+    default=False,
+    help="Emit JSON instead of a human-readable table.",
+)
+@click.option(
+    "--yes",
+    "assume_yes",
+    is_flag=True,
+    default=False,
+    help="Skip the 'yes' confirmation prompt.",
+)
+def undo_cmd(run_id: str, output_json: bool, assume_yes: bool) -> None:
+    """Reverse a previously-applied label or archive run.
+
+    Walks the run's audit_log rows and dispatches the inverse mutation
+    (label run → remove the gmailwiz/<category> label; archive run → re-add
+    INBOX). Requires the run to be in `committed` or `partially_failed`
+    state. Operates only on messages from that specific run — manually-
+    labeled / archived messages are untouched.
+    """
+    if output_json and not assume_yes:
+        click.echo(
+            "undo with --json requires --yes (cannot prompt under "
+            "JSON output mode without corrupting the payload).",
+            err=True,
+        )
+        sys.exit(2)
+    try:
+        rc = _run_undo(
+            run_id=run_id, output_json=output_json, assume_yes=assume_yes
+        )
+    except FileNotFoundError as exc:
+        click.echo(f"{type(exc).__name__}: {exc}", err=True)
+        sys.exit(2)
+    except ValueError as exc:
+        click.echo(f"{exc}", err=True)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        click.echo("\nCancelled.", err=True)
+        sys.exit(130)
     if rc != 0:
         sys.exit(rc)

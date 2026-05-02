@@ -132,6 +132,78 @@ def test_update_audit_entry_raises_on_unknown_id(conn):
         gw_db.update_audit_entry(conn, audit_id=9999, status="applied")
 
 
+def test_update_audit_entry_clear_error_nulls_existing_error(conn):
+    """`clear_error=True` must explicitly set the column back to NULL.
+    Used by `apply_undo_plan`'s success path to clear stale errors from
+    a prior failed undo attempt."""
+    run_id = gw_db.create_run(conn, phase="label", dry_run=True)
+    audit_id = gw_db.append_audit_entry(
+        conn,
+        run_id=run_id,
+        action="add_label",
+        message_id="m1",
+        before_label_ids=["INBOX"],
+        after_label_ids=["INBOX", "Label_42"],
+        status="applied",
+        error="prior failure",
+    )
+    # Sanity: error is set.
+    rows = gw_db.get_audit_entries(conn, run_id)
+    assert rows[0]["error"] == "prior failure"
+
+    # Clear the error.
+    gw_db.update_audit_entry(
+        conn, audit_id=audit_id, status="reverted", clear_error=True
+    )
+    rows = gw_db.get_audit_entries(conn, run_id)
+    assert rows[0]["status"] == "reverted"
+    assert rows[0]["error"] is None
+
+
+def test_update_audit_entry_error_and_clear_error_are_mutually_exclusive(conn):
+    """Passing both `error=<str>` and `clear_error=True` is contradictory
+    — the API must refuse rather than silently picking one."""
+    run_id = gw_db.create_run(conn, phase="label", dry_run=True)
+    audit_id = gw_db.append_audit_entry(
+        conn,
+        run_id=run_id,
+        action="add_label",
+        message_id="m1",
+        before_label_ids=["INBOX"],
+        after_label_ids=["INBOX", "Label_42"],
+        status="applied",
+    )
+    with pytest.raises(ValueError, match="not both"):
+        gw_db.update_audit_entry(
+            conn,
+            audit_id=audit_id,
+            status="reverted",
+            error="new error",
+            clear_error=True,
+        )
+
+
+def test_update_audit_entry_error_default_does_not_clear(conn):
+    """`error=None` (default) must preserve the existing error column —
+    NOT silently NULL it out. Otherwise apply_undo_plan's failure path
+    would inadvertently clear errors set by other update calls."""
+    run_id = gw_db.create_run(conn, phase="label", dry_run=True)
+    audit_id = gw_db.append_audit_entry(
+        conn,
+        run_id=run_id,
+        action="add_label",
+        message_id="m1",
+        before_label_ids=["INBOX"],
+        after_label_ids=["INBOX", "Label_42"],
+        status="applied",
+        error="keep me",
+    )
+    # Update status without touching error.
+    gw_db.update_audit_entry(conn, audit_id=audit_id, status="applied")
+    rows = gw_db.get_audit_entries(conn, run_id)
+    assert rows[0]["error"] == "keep me"
+
+
 def test_audit_log_round_trip(conn):
     run_id = gw_db.create_run(conn, phase="label", dry_run=True)
     gw_db.append_audit_entry(

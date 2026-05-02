@@ -1,8 +1,14 @@
 """Menu copy lives here so it's easy to tune without touching CLI plumbing.
 
-Phases 1 + 2 (preview/apply) expose options 1, 2, 3, 5, q. Option 4 (undo)
-ships with the next Phase 2 chunk; archive equivalents arrive in Phase 3.
-Placeholders are intentionally absent until those phases land.
+All phases shipped:
+  1 — show unread report
+  2 — preview labeling run
+  3 — apply previewed labeling run
+  4 — undo a previous run (label or archive)
+  5 — re-authenticate
+  6 — preview archive run
+  7 — apply previewed archive run
+  q — quit
 """
 
 from __future__ import annotations
@@ -62,6 +68,20 @@ MENU_OPTIONS: tuple[MenuOption, ...] = (
         ),
     ),
     MenuOption(
+        key="4",
+        label="Undo a previous run",
+        summary="Reverse a previously-applied label or archive run by date.",
+        detail=(
+            "Lists previously-applied label and archive runs (committed or "
+            "partially-failed). Pick one and confirm with 'yes' to reverse "
+            "it: a label run gets the gmailwiz/<category> label removed from "
+            "every message it labeled; an archive run gets INBOX re-added to "
+            "every message it archived. Operates only on messages from that "
+            "specific run — manually-labeled messages and other Gmail state "
+            "are untouched."
+        ),
+    ),
+    MenuOption(
         key="5",
         label="Re-authenticate with Google",
         summary="Refresh the OAuth token (needed every 7 days).",
@@ -69,6 +89,32 @@ MENU_OPTIONS: tuple[MenuOption, ...] = (
             "Opens a browser window so you can sign in to Google again and "
             "regenerate the OAuth refresh token. Required roughly every 7 days "
             "because the OAuth project is in Google's Testing mode."
+        ),
+    ),
+    MenuOption(
+        key="6",
+        label="Preview an archive run",
+        summary="From a previous labeling run, see which messages would be archived.",
+        detail=(
+            "Pick a previously-applied label run (committed or "
+            "partially-failed). gmailwiz fetches the current Gmail state of "
+            "those messages and builds an archive plan: every message that "
+            "still has INBOX would have INBOX removed (Gmail's definition of "
+            "'archive' — the message stays in All Mail and is fully "
+            "searchable, but disappears from your Inbox view). Nothing is "
+            "applied yet. Already-archived messages and ones Gmail can't "
+            "fetch are skipped and reported."
+        ),
+    ),
+    MenuOption(
+        key="7",
+        label="Apply a previewed archive run",
+        summary="Pick a previously-previewed archive run by date and apply it.",
+        detail=(
+            "Lists archive plans you've previewed but not yet applied. Pick "
+            "one and confirm with 'yes' to remove INBOX from every message "
+            "in that plan. The messages disappear from your Inbox view but "
+            "remain in All Mail. Reversible via menu option 4."
         ),
     ),
     MenuOption(

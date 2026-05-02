@@ -303,14 +303,25 @@ def list_runs(
     conn: sqlite3.Connection,
     *,
     phase: Optional[str] = None,
+    phases: Optional[Iterable[str]] = None,
     status: Optional[str] = None,
+    statuses: Optional[Iterable[str]] = None,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    """List recent runs, optionally filtered by phase and/or status. Newest first.
+    """List recent runs, optionally filtered by phase / phases / status /
+    statuses. Newest first.
 
-    Powers the menu's prior-run picker (option 3 / 4): the user sees recent
-    plans by date and category and selects by index, never typing a raw run id.
+    Powers the menu's prior-run pickers — option 3 (label-only),
+    option 4 (cross-phase undo), options 6/7 (archive). Use `phase` or
+    `status` for a single value, or `phases` / `statuses` for an
+    ``IN (...)`` filter. Pass at most ONE of (`phase`, `phases`) and at
+    most ONE of (`status`, `statuses`).
     """
+    if phase is not None and phases is not None:
+        raise ValueError("Pass either `phase` or `phases`, not both.")
+    if status is not None and statuses is not None:
+        raise ValueError("Pass either `status` or `statuses`, not both.")
+
     sql = (
         "SELECT id, phase, created_at, query, limit_count, category_filter, "
         "dry_run, status FROM runs"
@@ -320,9 +331,25 @@ def list_runs(
     if phase is not None:
         where.append("phase = ?")
         params.append(phase)
+    elif phases is not None:
+        phases_list = list(phases)
+        if not phases_list:
+            # Empty list means "no phases match" — short-circuit to no
+            # rows rather than building `phase IN ()` (invalid SQL).
+            return []
+        placeholders = ",".join("?" for _ in phases_list)
+        where.append(f"phase IN ({placeholders})")
+        params.extend(phases_list)
     if status is not None:
         where.append("status = ?")
         params.append(status)
+    elif statuses is not None:
+        statuses_list = list(statuses)
+        if not statuses_list:
+            return []
+        placeholders = ",".join("?" for _ in statuses_list)
+        where.append(f"status IN ({placeholders})")
+        params.extend(statuses_list)
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
@@ -430,6 +457,7 @@ def update_audit_entry(
     status: str,
     after_label_ids: Optional[list[str]] = None,
     error: Optional[str] = None,
+    clear_error: bool = False,
     ts: Optional[str] = None,
 ) -> None:
     """Update an audit_log row in place — used at commit time to flip
@@ -439,7 +467,15 @@ def update_audit_entry(
     Built as a partial-update so callers can omit fields they don't want to
     change. ``status`` is required because no caller of this function should
     leave a row in ``planned`` after a mutation attempt.
+
+    ``error=None`` means "don't touch the column" (preserves any prior
+    error string on the row). To explicitly clear a stale error from a
+    prior failed attempt — e.g., when an undo retry succeeds — pass
+    ``clear_error=True``. ``error=<str>`` and ``clear_error=True`` are
+    mutually exclusive.
     """
+    if error is not None and clear_error:
+        raise ValueError("Pass either `error` or `clear_error`, not both.")
     fields = ["status = ?"]
     params: list[Any] = [status]
     if after_label_ids is not None:
@@ -448,6 +484,8 @@ def update_audit_entry(
     if error is not None:
         fields.append("error = ?")
         params.append(error)
+    elif clear_error:
+        fields.append("error = NULL")
     if ts is not None:
         fields.append("ts = ?")
         params.append(ts)
