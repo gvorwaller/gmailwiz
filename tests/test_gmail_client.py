@@ -297,3 +297,197 @@ def test_get_message_metadata_handles_missing_headers(monkeypatch):
     assert results[0]["sender_email"] == ""
     assert results[0]["sender_name"] == ""
     assert results[0]["subject"] == "Headerless"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — labels.list / labels.create / messages.modify
+# ---------------------------------------------------------------------------
+
+
+def _build_fake_labels_service(*, list_response=None, create_responses=None, modify_responses=None):
+    """Stand-in for the gmail service that supports labels.list,
+    labels.create, and messages.modify.
+    """
+    list_response = list_response or {"labels": []}
+    create_responses = create_responses or {}
+    modify_responses = modify_responses or {}
+    create_calls: list[dict] = []
+    modify_calls: list[dict] = []
+
+    labels = MagicMock()
+
+    list_call = MagicMock()
+    list_call.execute.return_value = list_response
+    labels.list.return_value = list_call
+
+    def create_factory(*, userId, body):  # noqa: N803
+        create_calls.append({"userId": userId, "body": body})
+        call = MagicMock()
+        name = body.get("name")
+        resp = create_responses.get(name) or {"id": f"Label_for_{name}", "name": name}
+        if isinstance(resp, Exception):
+            call.execute.side_effect = resp
+        else:
+            call.execute.return_value = resp
+        return call
+
+    labels.create.side_effect = create_factory
+
+    messages = MagicMock()
+
+    def modify_factory(*, userId, id, body):  # noqa: N803
+        modify_calls.append({"userId": userId, "id": id, "body": body})
+        call = MagicMock()
+        resp = modify_responses.get(id) or {"id": id, "labelIds": []}
+        if isinstance(resp, Exception):
+            call.execute.side_effect = resp
+        else:
+            call.execute.return_value = resp
+        return call
+
+    messages.modify.side_effect = modify_factory
+
+    users = MagicMock()
+    users.labels.return_value = labels
+    users.messages.return_value = messages
+
+    service = MagicMock()
+    service.users.return_value = users
+    return service, create_calls, modify_calls
+
+
+def test_list_existing_labels_returns_name_to_id_map(monkeypatch):
+    fake, _, _ = _build_fake_labels_service(
+        list_response={"labels": [
+            {"id": "INBOX", "name": "INBOX"},
+            {"id": "Label_42", "name": "gmailwiz/promotional"},
+            {"id": "no_name"},  # malformed — should be skipped
+            {"name": "no_id"},  # malformed — should be skipped
+        ]}
+    )
+    monkeypatch.setattr(gmail_client, "_build_service", lambda creds: fake)
+
+    out = gmail_client.list_existing_labels(creds=MagicMock())
+    assert out == {"INBOX": "INBOX", "gmailwiz/promotional": "Label_42"}
+
+
+def test_ensure_labels_exist_returns_existing_id_without_create(monkeypatch):
+    fake, create_calls, _ = _build_fake_labels_service(
+        list_response={"labels": [
+            {"id": "Label_42", "name": "gmailwiz/promotional"},
+        ]}
+    )
+    monkeypatch.setattr(gmail_client, "_build_service", lambda creds: fake)
+
+    out = gmail_client.ensure_labels_exist(
+        creds=MagicMock(),
+        label_names=["gmailwiz/promotional"],
+    )
+    assert out == {"gmailwiz/promotional": "Label_42"}
+    assert create_calls == [], "should not have called labels.create"
+
+
+def test_ensure_labels_exist_creates_missing_label(monkeypatch):
+    fake, create_calls, _ = _build_fake_labels_service(
+        list_response={"labels": []},
+        create_responses={"gmailwiz/promotional": {"id": "Label_NEW", "name": "gmailwiz/promotional"}},
+    )
+    monkeypatch.setattr(gmail_client, "_build_service", lambda creds: fake)
+
+    out = gmail_client.ensure_labels_exist(
+        creds=MagicMock(),
+        label_names=["gmailwiz/promotional"],
+    )
+    assert out == {"gmailwiz/promotional": "Label_NEW"}
+    assert len(create_calls) == 1
+    body = create_calls[0]["body"]
+    assert body["name"] == "gmailwiz/promotional"
+    assert body["labelListVisibility"] == "labelShow"
+    assert body["messageListVisibility"] == "show"
+
+
+def test_ensure_labels_exist_mixed(monkeypatch):
+    """One label exists, one needs creating — both come back in the result."""
+    fake, create_calls, _ = _build_fake_labels_service(
+        list_response={"labels": [
+            {"id": "Label_42", "name": "gmailwiz/promotional"},
+        ]}
+    )
+    monkeypatch.setattr(gmail_client, "_build_service", lambda creds: fake)
+
+    out = gmail_client.ensure_labels_exist(
+        creds=MagicMock(),
+        label_names=["gmailwiz/promotional", "gmailwiz/newsletter"],
+    )
+    assert out["gmailwiz/promotional"] == "Label_42"
+    assert out["gmailwiz/newsletter"] == "Label_for_gmailwiz/newsletter"
+    assert [c["body"]["name"] for c in create_calls] == ["gmailwiz/newsletter"]
+
+
+def test_ensure_labels_exist_raises_on_missing_id_in_create_response(monkeypatch):
+    """If Gmail's create response omits an id, surface it loudly — don't silently
+    cache an empty string and pollute downstream calls."""
+    fake, _, _ = _build_fake_labels_service(
+        list_response={"labels": []},
+        create_responses={"gmailwiz/x": {"name": "gmailwiz/x"}},  # no id
+    )
+    monkeypatch.setattr(gmail_client, "_build_service", lambda creds: fake)
+
+    with pytest.raises(RuntimeError, match="no id"):
+        gmail_client.ensure_labels_exist(creds=MagicMock(), label_names=["gmailwiz/x"])
+
+
+def test_modify_labels_sends_add_only(monkeypatch):
+    fake, _, modify_calls = _build_fake_labels_service(
+        modify_responses={"m1": {"id": "m1", "labelIds": ["INBOX", "Label_42"]}},
+    )
+    monkeypatch.setattr(gmail_client, "_build_service", lambda creds: fake)
+
+    out = gmail_client.modify_labels(
+        creds=MagicMock(),
+        message_id="m1",
+        add_label_ids=["Label_42"],
+    )
+    assert out == {"id": "m1", "labelIds": ["INBOX", "Label_42"]}
+    assert len(modify_calls) == 1
+    assert modify_calls[0]["body"] == {"addLabelIds": ["Label_42"]}
+
+
+def test_modify_labels_sends_remove_only(monkeypatch):
+    fake, _, modify_calls = _build_fake_labels_service(
+        modify_responses={"m1": {"id": "m1", "labelIds": []}},
+    )
+    monkeypatch.setattr(gmail_client, "_build_service", lambda creds: fake)
+
+    gmail_client.modify_labels(
+        creds=MagicMock(),
+        message_id="m1",
+        remove_label_ids=["INBOX"],
+    )
+    assert modify_calls[0]["body"] == {"removeLabelIds": ["INBOX"]}
+
+
+def test_modify_labels_sends_add_and_remove(monkeypatch):
+    fake, _, modify_calls = _build_fake_labels_service()
+    monkeypatch.setattr(gmail_client, "_build_service", lambda creds: fake)
+
+    gmail_client.modify_labels(
+        creds=MagicMock(),
+        message_id="m1",
+        add_label_ids=["Label_42"],
+        remove_label_ids=["INBOX"],
+    )
+    body = modify_calls[0]["body"]
+    assert body == {"addLabelIds": ["Label_42"], "removeLabelIds": ["INBOX"]}
+
+
+def test_modify_labels_short_circuits_on_empty(monkeypatch):
+    """No add and no remove → no API call, return {}."""
+    sentinel = object()
+
+    def boom(creds):
+        raise AssertionError("should not have been called")
+
+    monkeypatch.setattr(gmail_client, "_build_service", boom)
+    out = gmail_client.modify_labels(creds=sentinel, message_id="m1")
+    assert out == {}

@@ -1,8 +1,9 @@
-"""Thin wrapper over googleapiclient for the Gmail operations Phase 1 needs.
+"""Thin wrapper over googleapiclient for the Gmail operations gmailwiz needs.
 
-Phase 1 is read-only: list unread message IDs, fetch lightweight metadata.
-Mutating helpers (`modify_labels`, `ensure_labels_exist`) belong in Phase 2 and
-are deliberately omitted here.
+Phase 1 reads (list unread, fetch metadata). Phase 2 adds label mutations
+(``list_existing_labels`` is read-only; ``ensure_labels_exist`` and
+``modify_labels`` mutate). All mutations surface raw ``HttpError`` verbatim
+per cs.md — never swallowed into a generic message.
 """
 
 from __future__ import annotations
@@ -206,3 +207,107 @@ def get_message_metadata(
         )
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — label mutations
+# ---------------------------------------------------------------------------
+
+
+def list_existing_labels(creds: Credentials) -> dict[str, str]:
+    """Read-only listing of every label in the user's account: ``{name: id}``.
+
+    Used at plan time to learn whether the target ``gmailwiz/<category>`` label
+    already exists. If it doesn't, the planner skips the "already labeled"
+    filter (a label that doesn't exist can't be on any message) and the
+    commit step creates it on demand via :func:`ensure_labels_exist`.
+    """
+    service = _build_service(creds)
+    resp = service.users().labels().list(userId="me").execute()
+    out: dict[str, str] = {}
+    for lbl in resp.get("labels", []):
+        name = lbl.get("name")
+        lid = lbl.get("id")
+        if name and lid:
+            out[name] = lid
+    return out
+
+
+def ensure_labels_exist(
+    creds: Credentials,
+    label_names: Iterable[str],
+) -> dict[str, str]:
+    """Return ``{name: id}`` for each requested label, creating any missing ones.
+
+    Mutating: invokes ``users.labels.create`` for absent names. Callers should
+    only invoke at commit time. New labels are visible in the label list and
+    in the message list (``labelShow`` / ``show``) so the user can see and
+    manually un-label from Gmail's UI if needed.
+    """
+    # Reuse `list_existing_labels` so the listing/parsing rules stay in one
+    # place. The extra service-build cost is one HTTP-less object construction.
+    by_name = list_existing_labels(creds)
+
+    needed = [name for name in label_names if name not in by_name]
+    if not needed:
+        return {name: by_name[name] for name in label_names}
+
+    service = _build_service(creds)
+    out: dict[str, str] = {name: by_name[name] for name in label_names if name in by_name}
+    for name in needed:
+        created = (
+            service.users()
+            .labels()
+            .create(
+                userId="me",
+                body={
+                    "name": name,
+                    "labelListVisibility": "labelShow",
+                    "messageListVisibility": "show",
+                },
+            )
+            .execute()
+        )
+        new_id = created.get("id")
+        if not new_id:
+            # Surface the unexpected response shape rather than papering over it.
+            raise RuntimeError(
+                f"Gmail labels.create returned no id for {name!r}: {created!r}"
+            )
+        out[name] = new_id
+    return out
+
+
+def modify_labels(
+    creds: Credentials,
+    *,
+    message_id: str,
+    add_label_ids: Iterable[str] = (),
+    remove_label_ids: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Apply a label mutation to a single message. Returns Gmail's response.
+
+    Idempotent: adding a label that's already present is a no-op for Gmail,
+    as is removing one that isn't. The returned ``labelIds`` reflect the
+    message's state *after* the modify (used by the audit_log to record the
+    real post-state, not just our projection).
+
+    A call with both add and remove empty short-circuits without an API
+    request and returns ``{}`` — the caller had nothing to do.
+    """
+    add_list = list(add_label_ids)
+    remove_list = list(remove_label_ids)
+    body: dict[str, Any] = {}
+    if add_list:
+        body["addLabelIds"] = add_list
+    if remove_list:
+        body["removeLabelIds"] = remove_list
+    if not body:
+        return {}
+    service = _build_service(creds)
+    return (
+        service.users()
+        .messages()
+        .modify(userId="me", id=message_id, body=body)
+        .execute()
+    )

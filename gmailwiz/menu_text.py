@@ -1,8 +1,8 @@
 """Menu copy lives here so it's easy to tune without touching CLI plumbing.
 
-Phase 1 only exposes options 1, 5, and q. Phases 2 and 3 will add 2/3/4 (label,
-apply, undo) and the archive equivalents — placeholders are intentionally
-absent from `MENU_OPTIONS` until those phases land.
+Phases 1 + 2 (preview/apply) expose options 1, 2, 3, 5, q. Option 4 (undo)
+ships with the next Phase 2 chunk; archive equivalents arrive in Phase 3.
+Placeholders are intentionally absent until those phases land.
 """
 
 from __future__ import annotations
@@ -33,6 +33,32 @@ MENU_OPTIONS: tuple[MenuOption, ...] = (
             "categorize each sender (promotional, transactional, newsletter, "
             "personal), and prints a grouped report. Nothing in Gmail is "
             "modified. You'll be asked how many messages to scan."
+        ),
+    ),
+    MenuOption(
+        key="2",
+        label="Preview a labeling run",
+        summary="See what would be labeled. Choose a category. Nothing is applied yet.",
+        detail=(
+            "Builds a labeling plan for a category you choose. Lists every "
+            "message that would receive the gmailwiz/<category> label, plus a "
+            "summary of why other messages were skipped. Saves the plan to "
+            "local state but does NOT modify Gmail. Apply it later with menu "
+            "option 3 (or `gmailwiz label --commit --run-id <id>`). "
+            "Senders that haven't been classified yet are skipped — run "
+            "option 1 (Show unread report) first to populate the cache."
+        ),
+    ),
+    MenuOption(
+        key="3",
+        label="Apply a previewed labeling run",
+        summary="Pick a previously-previewed run by date and apply it.",
+        detail=(
+            "Lists labeling plans you've previewed but not yet applied. Pick "
+            "one and confirm with 'yes' to apply the labels in Gmail. The "
+            "gmailwiz/<category> label is created in your Gmail account if it "
+            "doesn't already exist. Each message is mutated independently, so "
+            "a partial failure leaves a clear audit trail."
         ),
     ),
     MenuOption(

@@ -265,10 +265,70 @@ def get_run(conn: sqlite3.Connection, run_id: str) -> Optional[dict[str, Any]]:
     return dict(row) if row else None
 
 
-def update_run_status(conn: sqlite3.Connection, run_id: str, status: str) -> None:
-    """Update the ``status`` column on an existing run."""
+def update_run_status(
+    conn: sqlite3.Connection,
+    run_id: str,
+    status: str,
+    *,
+    dry_run: Optional[bool] = None,
+) -> None:
+    """Update the ``status`` column on an existing run.
+
+    Optional ``dry_run`` flag flips that column at the same time — used by
+    the commit path so a ``committed`` (or ``partially_failed`` / ``failed``)
+    run no longer reports ``dry_run=1``, which would otherwise produce
+    contradictory state for ad-hoc SQL queries and any future tooling that
+    reads ``dry_run`` rather than discriminating on ``status`` alone.
+
+    Raises ``KeyError`` if no row matches ``run_id`` — a typo'd id silently
+    matching zero rows would let a caller believe state was persisted when
+    it wasn't, masking real bugs at write time.
+    """
+    fields = ["status = ?"]
+    params: list[Any] = [status]
+    if dry_run is not None:
+        fields.append("dry_run = ?")
+        params.append(1 if dry_run else 0)
+    params.append(run_id)
     with conn:
-        conn.execute("UPDATE runs SET status = ? WHERE id = ?", (status, run_id))
+        cur = conn.execute(
+            f"UPDATE runs SET {', '.join(fields)} WHERE id = ?",
+            params,
+        )
+        if cur.rowcount == 0:
+            raise KeyError(f"No run with id {run_id!r}")
+
+
+def list_runs(
+    conn: sqlite3.Connection,
+    *,
+    phase: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """List recent runs, optionally filtered by phase and/or status. Newest first.
+
+    Powers the menu's prior-run picker (option 3 / 4): the user sees recent
+    plans by date and category and selects by index, never typing a raw run id.
+    """
+    sql = (
+        "SELECT id, phase, created_at, query, limit_count, category_filter, "
+        "dry_run, status FROM runs"
+    )
+    where: list[str] = []
+    params: list[Any] = []
+    if phase is not None:
+        where.append("phase = ?")
+        params.append(phase)
+    if status is not None:
+        where.append("status = ?")
+        params.append(status)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+    params.append(int(limit))
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +396,69 @@ def get_audit_entries(conn: sqlite3.Connection, run_id: str) -> list[dict[str, A
         d["after_label_ids"] = json.loads(d["after_label_ids"])
         out.append(d)
     return out
+
+
+def count_audit_entries(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    status: Optional[str] = None,
+    action: Optional[str] = None,
+) -> int:
+    """Count audit-log rows for a run, optionally filtered by status / action.
+
+    The `action` filter exists so callers can match the same set the
+    apply loop processes (status='planned' AND action='add_label') —
+    using only the status filter would over-count if a hand-edited or
+    foreign-action row landed in the run.
+    """
+    sql = "SELECT COUNT(*) FROM audit_log WHERE run_id = ?"
+    params: list[Any] = [run_id]
+    if status is not None:
+        sql += " AND status = ?"
+        params.append(status)
+    if action is not None:
+        sql += " AND action = ?"
+        params.append(action)
+    return int(conn.execute(sql, params).fetchone()[0])
+
+
+def update_audit_entry(
+    conn: sqlite3.Connection,
+    *,
+    audit_id: int,
+    status: str,
+    after_label_ids: Optional[list[str]] = None,
+    error: Optional[str] = None,
+    ts: Optional[str] = None,
+) -> None:
+    """Update an audit_log row in place — used at commit time to flip
+    ``planned`` -> ``applied`` / ``failed`` and record the actual
+    post-mutation label_ids returned by Gmail (never a projection).
+
+    Built as a partial-update so callers can omit fields they don't want to
+    change. ``status`` is required because no caller of this function should
+    leave a row in ``planned`` after a mutation attempt.
+    """
+    fields = ["status = ?"]
+    params: list[Any] = [status]
+    if after_label_ids is not None:
+        fields.append("after_label_ids = ?")
+        params.append(json.dumps(after_label_ids))
+    if error is not None:
+        fields.append("error = ?")
+        params.append(error)
+    if ts is not None:
+        fields.append("ts = ?")
+        params.append(ts)
+    params.append(audit_id)
+    with conn:
+        cur = conn.execute(
+            f"UPDATE audit_log SET {', '.join(fields)} WHERE id = ?",
+            params,
+        )
+        if cur.rowcount == 0:
+            raise KeyError(f"No audit_log row with id {audit_id!r}")
 
 
 # ---------------------------------------------------------------------------

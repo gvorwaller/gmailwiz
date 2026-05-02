@@ -4,12 +4,14 @@ Two ways in:
   * ``python -m gmailwiz``           → interactive menu (the day-to-day UX)
   * ``python -m gmailwiz <command>`` → direct subcommands (for scripting)
 
-Phase 1 wires:
+Wired commands:
   * ``auth``    — run OAuth, print the authenticated email
   * ``report``  — read-only sender-grouped unread report (`--limit`, `--json`)
+  * ``label``   — preview / commit a labeling run (Phase 2)
 
 The menu and subcommands share the same internal helpers (`_run_auth`,
-`_run_report`); the menu does **not** shell out to subprocesses.
+`_run_report`, `_run_label_plan`, `_run_label_commit`); the menu does **not**
+shell out to subprocesses.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import json as _json
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Optional
 
 import click
@@ -25,7 +28,8 @@ import click
 from gmailwiz import auth as gw_auth
 from gmailwiz import db as gw_db
 from gmailwiz import gmail_client
-from gmailwiz.categories import Category
+from gmailwiz import planning
+from gmailwiz.categories import CLASSIFIABLE_CATEGORIES, Category, gmail_label_name
 from gmailwiz.classifier import (
     MissingAPIKeyError,
     SenderInput,
@@ -36,6 +40,7 @@ from gmailwiz.menu_text import find_option, render_menu
 
 
 DEFAULT_REPORT_LIMIT = 100
+DEFAULT_LABEL_LIMIT = 100
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +310,18 @@ def _run_report(*, limit: int, output_json: bool) -> int:
             # Mark the run as failed before re-raising so an unexpected exit
             # doesn't leave a `planned` row dangling for a Phase-2 query to
             # mistake for actionable work.
-            gw_db.update_run_status(conn, run_id, "failed")
+            #
+            # Bookkeeping must never shadow the original exception: cs.md
+            # mandates raw error pass-through. `update_run_status` raises
+            # KeyError if the row doesn't exist (e.g., a KeyboardInterrupt
+            # landed inside `create_run`'s `with conn:` and rolled back
+            # the INSERT). Swallow any error from the bookkeeping call
+            # specifically so the original exception always reaches the
+            # caller.
+            try:
+                gw_db.update_run_status(conn, run_id, "failed")
+            except Exception:
+                pass
             raise
         else:
             # Reflect partial failures in the status. ANY gap counts as
@@ -393,6 +409,325 @@ def _run_report(*, limit: int, output_json: bool) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 — label plan / commit
+# ---------------------------------------------------------------------------
+
+
+def _print_label_plan_preview(plan: planning.LabelPlan, *, output_json: bool) -> None:
+    """Render a built `LabelPlan` for the user. JSON or table form."""
+    if output_json:
+        payload = {
+            "run_id": plan.run_id,
+            "category": plan.category.value,
+            "label_name": plan.label_name,
+            "target_label_id": plan.target_label_id,
+            "fetched_message_count": plan.fetched_message_count,
+            "fetch_failure_count": plan.fetch_failure_count,
+            "candidates": [
+                {
+                    "message_id": c.message_id,
+                    "thread_id": c.thread_id,
+                    "sender_email": c.sender_email,
+                    "subject": c.subject,
+                    "before_label_ids": c.before_label_ids,
+                    "after_label_ids": c.after_label_ids,
+                }
+                for c in plan.candidates
+            ],
+            "skipped": {
+                "unparseable": plan.skipped_unparseable,
+                "uncached": plan.skipped_uncached,
+                "unknown": plan.skipped_unknown,
+                "other_category": plan.skipped_other_category,
+                "already_labeled": plan.skipped_already_labeled,
+            },
+        }
+        click.echo(_json.dumps(payload, indent=2))
+        return
+
+    click.echo("")
+    click.echo(
+        f"Plan: add label '{plan.label_name}' to {len(plan.candidates)} message(s)."
+    )
+    click.echo(f"Run id: {plan.run_id}")
+    click.echo("")
+
+    if plan.candidates:
+        sender_w = min(
+            40,
+            max(len("SENDER"), max(len(c.sender_email) for c in plan.candidates)),
+        )
+        msgid_w = max(len("MESSAGE ID"), max(len(c.message_id) for c in plan.candidates))
+        click.echo(f"{'MESSAGE ID':<{msgid_w}}  {'SENDER':<{sender_w}}  SUBJECT")
+        for c in plan.candidates:
+            subj = c.subject if len(c.subject) <= 60 else c.subject[:59] + "…"
+            sender_cell = (
+                c.sender_email
+                if len(c.sender_email) <= sender_w
+                else c.sender_email[: sender_w - 1] + "…"
+            )
+            click.echo(f"{c.message_id:<{msgid_w}}  {sender_cell:<{sender_w}}  {subj}")
+        click.echo("")
+
+    if plan.fetch_failure_count:
+        click.echo(
+            f"Note: {plan.fetch_failure_count} message(s) listed by Gmail "
+            "could not be fetched (see stderr). The plan may be incomplete; "
+            "re-run preview to retry."
+        )
+        click.echo("")
+
+    if plan.total_skipped:
+        click.echo(f"Skipped {plan.total_skipped} message(s):")
+        if plan.skipped_unparseable:
+            click.echo(f"  - {plan.skipped_unparseable} with unparseable From: header")
+        if plan.skipped_uncached:
+            click.echo(
+                f"  - {plan.skipped_uncached} from senders not yet classified "
+                "(run option 1 / `report` to populate the cache)"
+            )
+        if plan.skipped_unknown:
+            click.echo(f"  - {plan.skipped_unknown} from senders classified as 'unknown'")
+        if plan.skipped_other_category:
+            click.echo(
+                f"  - {plan.skipped_other_category} from senders classified as "
+                "a different category"
+            )
+        if plan.skipped_already_labeled:
+            click.echo(
+                f"  - {plan.skipped_already_labeled} already carry the "
+                f"'{plan.label_name}' label"
+            )
+        click.echo("")
+
+    if plan.candidates:
+        click.echo(
+            f"Apply with: gmailwiz label --commit --run-id {plan.run_id}"
+        )
+        click.echo(
+            "(Or pick this run from the menu's "
+            "'Apply a previewed labeling run' option.)"
+        )
+    else:
+        click.echo("Nothing to label. No run to apply.")
+
+
+def _run_label_plan(
+    *,
+    category: Category,
+    limit: int,
+    output_json: bool,
+) -> int:
+    """Build and persist a label plan, then print the preview."""
+    if limit <= 0:
+        click.echo("--limit must be greater than zero.", err=True)
+        return 2
+    if category not in CLASSIFIABLE_CATEGORIES:
+        click.echo(
+            f"Cannot plan for non-classifiable category {category.value!r}.",
+            err=True,
+        )
+        return 2
+
+    creds = gw_auth.get_credentials()
+    _progress(
+        f"Building label plan for '{category.value}' (scan up to {limit} unread)...",
+        output_json=output_json,
+    )
+    with gw_db.open_db() as conn:
+        plan = planning.build_label_plan(
+            creds=creds,
+            conn=conn,
+            category=category,
+            limit=limit,
+        )
+    _print_label_plan_preview(plan, output_json=output_json)
+    return 0
+
+
+def _label_commit_progress(stage: str, info: dict[str, Any], *, output_json: bool) -> None:
+    """Stderr progress output for `apply_label_plan`. Suppressed under --json."""
+    if output_json:
+        return
+    if stage == "apply_begin":
+        click.echo(
+            f"Applying label '{info['label_name']}' to {info['total']} message(s)...",
+            err=True,
+        )
+    elif stage == "apply_done":
+        click.echo(
+            f"  [{info['index']}/{info['total']}] applied to {info['message_id']}",
+            err=True,
+        )
+    elif stage == "apply_failed":
+        click.echo(
+            f"  [{info['index']}/{info['total']}] FAILED on {info['message_id']}: "
+            f"{info['error']}",
+            err=True,
+        )
+
+
+def _run_label_commit(
+    *,
+    run_id: str,
+    output_json: bool,
+    assume_yes: bool = False,
+) -> int:
+    """Apply a previously-built label plan by run id."""
+    # Defense-in-depth: `label_cmd` already rejects --commit --json without
+    # --yes upstream, but any other caller (menu, future code) reaching this
+    # function with `output_json=True, assume_yes=False` would have skipped
+    # the prompt silently and mutated Gmail with no confirmation. Refuse.
+    if output_json and not assume_yes:
+        click.echo(
+            "Refusing to commit under JSON output without explicit --yes "
+            "(prompt would corrupt the JSON payload).",
+            err=True,
+        )
+        return 2
+
+    # Validate the run row + count planned audit rows BEFORE triggering
+    # OAuth — a typo'd `--run-id` shouldn't force a needless token
+    # refresh (and a possible browser flow if the token is expired).
+    with gw_db.open_db() as conn:
+        run = gw_db.get_run(conn, run_id)
+        if run is None:
+            click.echo(f"No run with id {run_id!r}.", err=True)
+            return 2
+        if run.get("phase") != "label":
+            click.echo(
+                f"Run {run_id!r} has phase={run.get('phase')!r}, expected 'label'.",
+                err=True,
+            )
+            return 2
+        if run.get("status") != "planned":
+            click.echo(
+                f"Run {run_id!r} has status={run.get('status')!r}; only "
+                "'planned' runs can be applied.",
+                err=True,
+            )
+            return 2
+
+        # Filter on action='add_label' too, so the count matches the set
+        # `apply_label_plan` will actually process (a hand-edited row with a
+        # foreign action would otherwise inflate this count and mislead the
+        # user about how many messages will be touched).
+        planned_count = gw_db.count_audit_entries(
+            conn, run_id, status="planned", action="add_label"
+        )
+        if planned_count == 0:
+            if output_json:
+                # Stay JSON-shaped under --json so consumers don't have
+                # to special-case stdout-vs-stderr or text-vs-payload.
+                click.echo(
+                    _json.dumps(
+                        {
+                            "run_id": run_id,
+                            "label_id": "",
+                            "applied": 0,
+                            "failed": 0,
+                            "errors": [],
+                            "run_status": "planned",
+                            "note": "no planned audit entries — nothing to do",
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                click.echo(
+                    f"Run {run_id!r} has no planned audit entries — nothing to do."
+                )
+            return 0
+
+        if not assume_yes and not output_json:
+            # Resolve the label name through the canonical mapping so this
+            # string can never drift from `gmail_label_name`.
+            raw_category = run.get("category_filter")
+            try:
+                label_name = gmail_label_name(Category(raw_category or ""))
+            except ValueError:
+                # Defensive: a hand-edited DB could land here. Render the
+                # raw column value rather than crashing — and avoid the
+                # ugly `gmailwiz/None` string when the column is NULL by
+                # showing `<unknown>` instead.
+                label_name = (
+                    f"gmailwiz/{raw_category}"
+                    if raw_category
+                    else "gmailwiz/<unknown>"
+                )
+            click.echo(
+                f"About to add label '{label_name}' to "
+                f"{planned_count} message(s) in Gmail."
+            )
+            confirm = _prompt(
+                "Type 'yes' to proceed (anything else cancels): "
+            ).strip().lower()
+            if confirm != "yes":
+                click.echo("Cancelled.")
+                # Cancel is not an error — user explicitly chose not to
+                # mutate. Returning 0 keeps the documented exit-code set
+                # (0 / 2 / 4 / 5) tight.
+                return 0
+
+        # Validation passed and the user confirmed — now do the OAuth dance.
+        # Doing it here (rather than at the top of the function) avoids a
+        # needless token refresh / browser flow when the user typo'd their
+        # `--run-id`.
+        creds = gw_auth.get_credentials()
+        result = planning.apply_label_plan(
+            creds=creds,
+            conn=conn,
+            run_id=run_id,
+            on_progress=lambda stage, info: _label_commit_progress(
+                stage, info, output_json=output_json
+            ),
+        )
+
+    if output_json:
+        click.echo(
+            _json.dumps(
+                {
+                    "run_id": result.run_id,
+                    "label_id": result.label_id,
+                    "applied": result.applied,
+                    "failed": result.failed,
+                    "errors": [{"message_id": mid, "error": err} for mid, err in result.errors],
+                    "run_status": result.run_status,
+                },
+                indent=2,
+            )
+        )
+    else:
+        click.echo("")
+        click.echo(
+            f"Run {result.run_id}: {result.applied} applied, "
+            f"{result.failed} failed. status={result.run_status}"
+        )
+        if result.errors:
+            click.echo("Failures:")
+            for mid, err in result.errors:
+                click.echo(f"  - {mid}: {err}")
+
+    # Exit code:
+    #   committed              → 0
+    #   planned                → 0  (vacuous: nothing actually happened.
+    #                                Reachable only if the audit rows
+    #                                fail the action='add_label' filter
+    #                                inside apply_label_plan despite
+    #                                count_audit_entries(status='planned')
+    #                                being non-zero — i.e., a hand-edited
+    #                                archive row in a label run. No Gmail
+    #                                mutation occurred; not a failure.)
+    #   partially_failed       → 4 (some succeeded; signal partial)
+    #   failed                 → 5 (none succeeded)
+    if result.run_status in {"committed", "planned"}:
+        return 0
+    if result.run_status == "partially_failed":
+        return 4
+    return 5
+
+
+# ---------------------------------------------------------------------------
 # Menu
 # ---------------------------------------------------------------------------
 
@@ -452,6 +787,159 @@ def _menu_show_report() -> None:
         click.echo(f"Report failed: {type(exc).__name__}: {exc}", err=True)
 
 
+def _menu_pick_int(prompt_text: str, *, lo: int, hi: int) -> Optional[int]:
+    """Prompt for an integer in ``[lo, hi]``. Returns ``None`` on cancel.
+
+    Used by the menu pickers. Empty input or ``q``/``quit`` cancels;
+    out-of-range or non-numeric input prints a note and also cancels (the
+    user is one keystroke from re-opening the picker — no recovery loop).
+    """
+    raw = _prompt(prompt_text).strip().lower()
+    if not raw or raw in {"q", "quit"}:
+        return None
+    try:
+        idx = int(raw)
+    except ValueError:
+        click.echo(f"'{raw}' is not a number; cancelled.")
+        return None
+    if not (lo <= idx <= hi):
+        click.echo(f"Out of range; cancelled.")
+        return None
+    return idx
+
+
+def _menu_preview_label() -> None:
+    """Menu option 2: pick category, build a label plan, show preview."""
+    opt = find_option("2")
+    if opt:
+        click.echo("")
+        click.echo(opt.detail)
+        click.echo("")
+
+    classifiable = list(CLASSIFIABLE_CATEGORIES)
+    click.echo("Pick a category to label:")
+    for i, c in enumerate(classifiable, start=1):
+        click.echo(f"  {i}. {c.value}")
+    click.echo("  q. Cancel")
+    idx = _menu_pick_int("> ", lo=1, hi=len(classifiable))
+    if idx is None:
+        return
+    category = classifiable[idx - 1]
+
+    raw = _prompt(
+        f"How many unread messages to scan? [{DEFAULT_LABEL_LIMIT}] (or 'q' to cancel) "
+    ).strip()
+    if raw.lower() in {"q", "quit"}:
+        return
+    if not raw:
+        limit = DEFAULT_LABEL_LIMIT
+    else:
+        try:
+            limit = int(raw)
+        except ValueError:
+            click.echo(f"'{raw}' is not a number; using default ({DEFAULT_LABEL_LIMIT}).")
+            limit = DEFAULT_LABEL_LIMIT
+        else:
+            if limit <= 0:
+                click.echo(
+                    f"Limit must be positive; using default ({DEFAULT_LABEL_LIMIT})."
+                )
+                limit = DEFAULT_LABEL_LIMIT
+
+    try:
+        _run_label_plan(category=category, limit=limit, output_json=False)
+    except KeyboardInterrupt:
+        click.echo("\nCancelled.")
+    except Exception as exc:  # surface raw errors per cs.md
+        click.echo(f"Plan failed: {type(exc).__name__}: {exc}", err=True)
+
+
+def _format_run_timestamp(iso_ts: str) -> str:
+    """Prettify the DB's UTC ISO ``created_at`` into local-time ``YYYY-MM-DD HH:MM``.
+
+    The DB stores ``datetime.now(timezone.utc).isoformat(timespec="seconds")``
+    (UTC). The user reading the picker is on local time — calling the
+    no-arg form of ``astimezone()`` picks up the system tz and converts.
+    A naive datetime (only possible from a hand-edited DB row) is
+    *interpreted* as local time by ``astimezone()`` per Python 3.6+
+    semantics — that's a slight mismatch with the project's UTC-by-
+    default storage convention, but it's preferable to special-casing
+    legacy/malformed input. Falls back to the raw string if it's not
+    parseable at all.
+    """
+    try:
+        dt = datetime.fromisoformat(iso_ts)
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return iso_ts
+
+
+def _menu_apply_label() -> None:
+    """Menu option 3: list planned label runs, pick one, confirm, apply."""
+    opt = find_option("3")
+    if opt:
+        click.echo("")
+        click.echo(opt.detail)
+        click.echo("")
+
+    with gw_db.open_db() as conn:
+        all_runs = gw_db.list_runs(conn, phase="label", status="planned", limit=20)
+        # Hydrate with planned-audit-row counts and drop:
+        #   * runs with zero planned rows — `build_label_plan` writes a
+        #     run row even when no messages match (audit trail), but
+        #     surfacing those in the apply picker is just noise.
+        #   * runs whose `category_filter` doesn't parse to a valid
+        #     `Category` — apply would error out with `ValueError` mid-
+        #     flight; better to hide them than to let the user pick a
+        #     row that's guaranteed to fail.
+        runs = []
+        for r in all_runs:
+            # Match the apply filter (status='planned' AND action='add_label')
+            # so a contaminated run can't show a misleading count here.
+            r["count"] = gw_db.count_audit_entries(
+                conn, r["id"], status="planned", action="add_label"
+            )
+            if r["count"] == 0:
+                continue
+            try:
+                cat = Category(r.get("category_filter") or "")
+            except ValueError:
+                continue
+            # Skip UNKNOWN — `apply_label_plan` rejects it as defense-in-
+            # depth, so showing it in the picker would only let the user
+            # pick a row that's guaranteed to fail mid-apply.
+            if cat is Category.UNKNOWN:
+                continue
+            runs.append(r)
+
+    if not runs:
+        click.echo("No previewed labeling runs to apply.")
+        click.echo("Use option 2 (Preview a labeling run) to create one first.")
+        return
+
+    click.echo("Which previewed labeling run do you want to apply?")
+    for i, r in enumerate(runs, start=1):
+        click.echo(
+            f"  {i}. {_format_run_timestamp(r['created_at'])}  — "
+            f"{r.get('category_filter') or '?'}, "
+            f"{r['count']} message(s), planned"
+        )
+    click.echo("  q. Cancel")
+    idx = _menu_pick_int("> ", lo=1, hi=len(runs))
+    if idx is None:
+        return
+    chosen = runs[idx - 1]
+
+    try:
+        _run_label_commit(
+            run_id=chosen["id"], output_json=False, assume_yes=False
+        )
+    except KeyboardInterrupt:
+        click.echo("\nCancelled.")
+    except Exception as exc:  # surface raw errors per cs.md
+        click.echo(f"Apply failed: {type(exc).__name__}: {exc}", err=True)
+
+
 def _menu_reauth() -> None:
     """Menu option 5: re-run OAuth, refreshing the token."""
     opt = find_option("5")
@@ -470,11 +958,24 @@ def _menu_reauth() -> None:
 
 
 def menu() -> None:
-    """Interactive menu loop. Runs until the user picks ``q``."""
+    """Interactive menu loop. Runs until the user picks ``q``.
+
+    `_prompt` translates Ctrl-C/EOF at a prompt into a clean "q" cancel,
+    so a Ctrl-C *while* a sub-flow is prompting cancels that sub-flow
+    and returns here. A Ctrl-C between iterations (e.g., during the
+    `click.echo(render_menu())` print, or while a sub-flow's `try/except`
+    is unwinding) would otherwise propagate as a traceback. Catch it
+    and exit cleanly.
+    """
     while True:
-        click.echo("")
-        click.echo(render_menu())
-        choice = _prompt("> ").strip().lower()
+        try:
+            click.echo("")
+            click.echo(render_menu())
+            choice = _prompt("> ").strip().lower()
+        except KeyboardInterrupt:
+            click.echo("")
+            click.echo("Bye.")
+            return
 
         if not choice:
             # Empty input → redisplay the menu, don't exit. Quitting requires
@@ -493,14 +994,18 @@ def menu() -> None:
 
         if opt.key == "1":
             _menu_show_report()
+        elif opt.key == "2":
+            _menu_preview_label()
+        elif opt.key == "3":
+            _menu_apply_label()
         elif opt.key == "5":
             _menu_reauth()
-        elif opt.key == "q":
-            click.echo("Bye.")
-            return
         else:
-            # Defensive: a Phase 2/3 option somehow leaked in.
-            click.echo(f"Option '{opt.key}' is not implemented in Phase 1.")
+            # The "q" option is handled by the early-out above, so reaching
+            # here means a Phase 3 (or future) option leaked into the menu
+            # without a dispatcher branch. Surface loudly rather than silently
+            # ignoring.
+            click.echo(f"Option '{opt.key}' is not implemented yet.")
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +1016,7 @@ def menu() -> None:
 @click.group(invoke_without_command=True, context_settings={"help_option_names": ["-h", "--help"]})
 @click.pass_context
 def main(ctx: click.Context) -> None:
-    """gmailwiz — AI-assisted Gmail inbox triage (Phase 1: read-only)."""
+    """gmailwiz — AI-assisted Gmail inbox triage. Read, preview, label."""
     if ctx.invoked_subcommand is None:
         menu()
 
@@ -545,5 +1050,119 @@ def report_cmd(limit: int, output_json: bool) -> None:
         # Plain error, no traceback — user just needs to set the env var.
         click.echo(str(exc), err=True)
         sys.exit(2)
+    if rc != 0:
+        sys.exit(rc)
+
+
+@main.command("label")
+@click.option(
+    "--category",
+    type=click.Choice([c.value for c in CLASSIFIABLE_CATEGORIES]),
+    default=None,
+    help="Category to label (required for preview; ignored for --commit).",
+)
+@click.option(
+    "--limit",
+    type=int,
+    default=DEFAULT_LABEL_LIMIT,
+    show_default=True,
+    help="Maximum number of unread messages to scan when previewing.",
+)
+@click.option(
+    "--commit",
+    is_flag=True,
+    default=False,
+    help="Apply a previously-previewed plan. Requires --run-id.",
+)
+@click.option(
+    "--run-id",
+    "run_id",
+    type=str,
+    default=None,
+    help="Run id of a previously-previewed plan (required with --commit).",
+)
+@click.option(
+    "--json",
+    "output_json",
+    is_flag=True,
+    default=False,
+    help="Emit JSON instead of a human-readable table.",
+)
+@click.option(
+    "--yes",
+    "assume_yes",
+    is_flag=True,
+    default=False,
+    help="Skip the 'yes' confirmation prompt at commit time.",
+)
+def label_cmd(
+    category: Optional[str],
+    limit: int,
+    commit: bool,
+    run_id: Optional[str],
+    output_json: bool,
+    assume_yes: bool,
+) -> None:
+    """Preview or apply a labeling run.
+
+    Default mode is preview (dry-run): builds a plan, persists it, prints it.
+    No Gmail mutations occur. Apply later with `--commit --run-id <id>`.
+    """
+    if commit:
+        if not run_id:
+            click.echo("--commit requires --run-id <id>.", err=True)
+            sys.exit(2)
+        if output_json and not assume_yes:
+            # Confirmation prompts on stdout would corrupt the JSON payload
+            # downstream consumers expect. Rather than silently mutating
+            # without a prompt, force the user to be explicit: pass `--yes`
+            # to skip the prompt OR drop `--json` to get the prompt.
+            click.echo(
+                "--commit with --json requires --yes (cannot prompt under "
+                "JSON output mode without corrupting the payload).",
+                err=True,
+            )
+            sys.exit(2)
+        if category:
+            click.echo(
+                "--category is ignored with --commit (the run id determines "
+                "the target label).",
+                err=True,
+            )
+        try:
+            rc = _run_label_commit(
+                run_id=run_id, output_json=output_json, assume_yes=assume_yes
+            )
+        except FileNotFoundError as exc:
+            # Most common cause: missing credentials.json. Mirror
+            # report_cmd's clean-exit-without-traceback pattern for
+            # well-known user errors.
+            click.echo(f"{type(exc).__name__}: {exc}", err=True)
+            sys.exit(2)
+    else:
+        if not category:
+            click.echo(
+                "--category is required for preview mode (omit --commit, "
+                "supply --category).",
+                err=True,
+            )
+            sys.exit(2)
+        if run_id:
+            click.echo(
+                "--run-id is only meaningful with --commit; ignoring.",
+                err=True,
+            )
+        if assume_yes:
+            click.echo(
+                "--yes is only meaningful with --commit; ignoring.",
+                err=True,
+            )
+        try:
+            rc = _run_label_plan(
+                category=Category(category), limit=limit, output_json=output_json
+            )
+        except FileNotFoundError as exc:
+            click.echo(f"{type(exc).__name__}: {exc}", err=True)
+            sys.exit(2)
     if rc != 0:
         sys.exit(rc)

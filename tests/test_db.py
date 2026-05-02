@@ -112,6 +112,26 @@ def test_update_run_status(conn):
     assert row["status"] == "committed"
 
 
+def test_update_run_status_flips_dry_run(conn):
+    run_id = gw_db.create_run(conn, phase="label", dry_run=True)
+    gw_db.update_run_status(conn, run_id, "committed", dry_run=False)
+    row = gw_db.get_run(conn, run_id)
+    assert row["status"] == "committed"
+    assert row["dry_run"] == 0
+
+
+def test_update_run_status_raises_on_unknown_id(conn):
+    """A typo'd run_id silently matching zero rows would let a caller
+    believe state was persisted when it wasn't. Surface the miss loudly."""
+    with pytest.raises(KeyError, match="No run with id"):
+        gw_db.update_run_status(conn, "does-not-exist", "committed")
+
+
+def test_update_audit_entry_raises_on_unknown_id(conn):
+    with pytest.raises(KeyError, match="No audit_log row"):
+        gw_db.update_audit_entry(conn, audit_id=9999, status="applied")
+
+
 def test_audit_log_round_trip(conn):
     run_id = gw_db.create_run(conn, phase="label", dry_run=True)
     gw_db.append_audit_entry(

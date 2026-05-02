@@ -25,6 +25,9 @@ data/
 .idea/
 .vscode/
 
+# Claude Code agent worktrees (runtime; not source)
+.claude/worktrees/
+
 # td local store (per-project, not portable)
 .todos/
 .sidecar/
