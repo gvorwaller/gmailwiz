@@ -14,7 +14,7 @@ news@nytimes.com                 47   newsletter      The Morning: ...
 do-not-reply@chase.com           23   transactional   Your statement is ready
 deals@homedepot.com              19   promotional     Spring savings up to 40%
 linkedin@e.linkedin.com          14   promotional     People you may know
-mom@vorwaller.net                 3   personal        Re: Easter plans
+mom@example.net                   3   personal        Re: Easter plans
 calendly@calendly.com             2   transactional   New event: ...
 ```
 
