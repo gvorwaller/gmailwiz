@@ -178,11 +178,30 @@ def _run_flow(credentials_path: Path) -> Credentials:
     )
 
 
+class AuthRequired(Exception):
+    """Headless auth could not produce valid credentials.
+
+    Raised by ``get_credentials(interactive=False)`` when the only path to
+    valid credentials would require launching the OAuth browser flow — i.e.
+    the trigger service / one-pass run has detected that the operator needs
+    to re-auth manually on M4.
+
+    The ``reason`` attribute captures *why* (missing token, missing
+    credentials.json, refresh failure, no refresh_token) so callers can
+    surface a useful Telegram / JSON message.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
 def get_credentials(
     *,
     credentials_path: Optional[Path] = None,
     token_path: Optional[Path] = None,
     force_reauth: bool = False,
+    interactive: bool = True,
 ) -> Credentials:
     """Return valid Google credentials, running the OAuth flow if needed.
 
@@ -196,7 +215,10 @@ def get_credentials(
     Behavior:
       * ``force_reauth=True`` — always run the OAuth flow fresh, overwriting
         any existing ``token.json``. This is the path the menu's
-        "Re-authenticate" option uses.
+        "Re-authenticate" option uses. Forbidden with ``interactive=False``.
+      * ``interactive=False`` (headless mode, used by ``oneshot.run_one_pass``
+        and the FastAPI trigger): raise ``AuthRequired`` instead of ever
+        invoking ``_run_flow``. Used on M2 where there's no browser session.
       * Otherwise: load ``token.json`` if present; if expired and refreshable,
         refresh it; otherwise run the OAuth flow.
     """
@@ -204,6 +226,11 @@ def get_credentials(
         credentials_path = DEFAULT_CREDENTIALS_PATH
     if token_path is None:
         token_path = DEFAULT_TOKEN_PATH
+
+    if force_reauth and not interactive:
+        raise AuthRequired(
+            "force_reauth requires interactive=True (browser flow cannot run headless)"
+        )
 
     if force_reauth:
         creds = _run_flow(credentials_path)
@@ -222,13 +249,26 @@ def get_credentials(
             return creds
         except Exception as exc:
             # Refresh can fail for several reasons: 7-day Testing-mode TTL,
-            # revoked grant, network outage, clock skew. Fall through to the
-            # interactive flow rather than masking the error — but log to
-            # stderr so the user can tell why we're prompting again.
+            # revoked grant, network outage, clock skew.
+            if not interactive:
+                raise AuthRequired(
+                    f"token refresh failed ({type(exc).__name__}: {exc})"
+                ) from exc
+            # Interactive: fall through to a fresh flow, but log to stderr so
+            # the user can tell why we're prompting again.
             sys.stderr.write(
                 f"Token refresh failed ({type(exc).__name__}: {exc}); "
                 "starting interactive auth.\n"
             )
+
+    if not interactive:
+        if creds is None:
+            raise AuthRequired(f"no token at {token_path}")
+        if not creds.refresh_token:
+            raise AuthRequired("token has no refresh_token (re-auth on M4)")
+        # Expired+refreshable already handled above; remaining case is
+        # otherwise-invalid credentials (e.g. revoked grant). Surface it.
+        raise AuthRequired("stored credentials are not valid and not refreshable")
 
     creds = _run_flow(credentials_path)
     _save_token(creds, token_path)

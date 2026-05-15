@@ -28,6 +28,7 @@ import click
 from gmailwiz import auth as gw_auth
 from gmailwiz import db as gw_db
 from gmailwiz import gmail_client
+from gmailwiz import oneshot as gw_oneshot
 from gmailwiz import planning
 from gmailwiz.categories import CLASSIFIABLE_CATEGORIES, Category, gmail_label_name
 from gmailwiz.classifier import (
@@ -41,6 +42,7 @@ from gmailwiz.menu_text import find_option, render_menu
 
 DEFAULT_REPORT_LIMIT = 100
 DEFAULT_LABEL_LIMIT = 100
+DEFAULT_ONESHOT_LIMIT = 1000
 
 
 # ---------------------------------------------------------------------------
@@ -1754,6 +1756,161 @@ def _menu_apply_archive() -> None:
         click.echo(f"Apply failed: {type(exc).__name__}: {exc}", err=True)
 
 
+def _format_oneshot_summary(result: gw_oneshot.OneShotResult) -> str:
+    """Human-readable rollup of a OneShotResult for menu / non-JSON output."""
+    lines = [
+        f"status: {result.status}"
+        + (f"  ({result.error_code})" if result.error_code else ""),
+        f"snapshot: {result.snapshot_size} message(s) scanned",
+        f"classified senders: {result.classified_sender_count}",
+        f"wall: {result.wall_seconds:.1f}s",
+    ]
+    for cat in result.categories:
+        seg = (
+            f"  {cat.category:<14} "
+            f"label: {cat.labels_applied} applied / {cat.labels_failed} failed"
+        )
+        if cat.archive_run_id is not None:
+            seg += (
+                f"   archive: {cat.archive_applied} applied / "
+                f"{cat.archive_failed} failed"
+            )
+        if cat.error:
+            seg += f"   ERROR: {cat.error}"
+        lines.append(seg)
+    if result.notes:
+        lines.append("notes:")
+        for n in result.notes:
+            lines.append(f"  - {n}")
+    return "\n".join(lines)
+
+
+def _run_one_pass(
+    *,
+    limit: int,
+    archive: bool,
+    output_json: bool,
+    interactive_auth: bool = True,
+) -> int:
+    """Drive `oneshot.run_one_pass`, render output, return exit code."""
+    if limit <= 0:
+        click.echo("--limit must be greater than zero.", err=True)
+        return 2
+
+    try:
+        creds = gw_auth.get_credentials(interactive=interactive_auth)
+    except gw_oneshot.AuthRequired as exc:
+        payload = {
+            "status": "auth_required",
+            "error_code": "auth_required",
+            "reason": exc.reason,
+        }
+        if output_json:
+            click.echo(_json.dumps(payload, indent=2))
+        else:
+            click.echo(
+                f"auth_required: {exc.reason}\n"
+                "Re-authenticate on M4 (menu option 5) and retry.",
+                err=True,
+            )
+        return 2
+
+    def _progress(stage: str, info: dict[str, Any]) -> None:
+        if output_json:
+            return
+        # Concise stderr progress — one line per phase boundary.
+        if stage == "snapshot_done":
+            click.echo(
+                f"Snapshot: {info['metadata_fetched']} message(s) "
+                f"({info['fetch_failures']} fetch failure(s)).",
+                err=True,
+            )
+        elif stage == "classify_done":
+            click.echo(
+                f"Classified {info['classified']} sender(s).",
+                err=True,
+            )
+        elif stage == "category_begin":
+            click.echo(f"--- {info['category']} ---", err=True)
+        elif stage == "label_done":
+            click.echo(
+                f"  label: {info['applied']} applied, {info['failed']} failed.",
+                err=True,
+            )
+        elif stage == "archive_done":
+            click.echo(
+                f"  archive: {info['applied']} applied, {info['failed']} failed.",
+                err=True,
+            )
+
+    try:
+        result = gw_oneshot.run_one_pass(
+            creds=creds,
+            limit=limit,
+            archive=archive,
+            on_progress=_progress,
+        )
+    except MissingAPIKeyError as exc:
+        click.echo(str(exc), err=True)
+        return 2
+
+    if output_json:
+        click.echo(_json.dumps(result.to_dict(), indent=2))
+    else:
+        click.echo("")
+        click.echo(_format_oneshot_summary(result))
+
+    if result.status == "success":
+        return 0
+    if result.status == "auth_required":
+        return 2
+    if result.status == "partial_failure":
+        return 4
+    return 5
+
+
+def _menu_run_one_pass() -> None:
+    """Menu option 8: report → label-all → archive-all, prompt only for limit."""
+    opt = find_option("8")
+    if opt:
+        click.echo("")
+        click.echo(opt.detail)
+        click.echo("")
+    raw = _prompt(
+        f"How many unread messages to scan? [{DEFAULT_ONESHOT_LIMIT}] (or 'q' to cancel) "
+    ).strip()
+    if raw.lower() in {"q", "quit"}:
+        return
+    if not raw:
+        limit = DEFAULT_ONESHOT_LIMIT
+    else:
+        try:
+            limit = int(raw)
+        except ValueError:
+            click.echo(
+                f"'{raw}' is not a number; using default ({DEFAULT_ONESHOT_LIMIT})."
+            )
+            limit = DEFAULT_ONESHOT_LIMIT
+        else:
+            if limit <= 0:
+                click.echo(
+                    f"Limit must be positive; using default ({DEFAULT_ONESHOT_LIMIT})."
+                )
+                limit = DEFAULT_ONESHOT_LIMIT
+
+    try:
+        _run_one_pass(
+            limit=limit,
+            archive=True,
+            output_json=False,
+            interactive_auth=True,
+        )
+    except KeyboardInterrupt:
+        click.echo("\nCancelled.")
+    except Exception as exc:  # surface raw errors per cs.md
+        click.echo(f"Run failed: {type(exc).__name__}: {exc}", err=True)
+
+
 def _menu_reauth() -> None:
     """Menu option 5: re-run OAuth, refreshing the token."""
     opt = find_option("5")
@@ -1820,6 +1977,8 @@ def menu() -> None:
             _menu_preview_archive()
         elif opt.key == "7":
             _menu_apply_archive()
+        elif opt.key == "8":
+            _menu_run_one_pass()
         else:
             # The "q" option is handled by the early-out above, so reaching
             # here means a future option leaked into the menu without a
@@ -2164,6 +2323,61 @@ def undo_cmd(run_id: str, output_json: bool, assume_yes: bool) -> None:
     except ValueError as exc:
         click.echo(f"{exc}", err=True)
         sys.exit(2)
+    except KeyboardInterrupt:
+        click.echo("\nCancelled.", err=True)
+        sys.exit(130)
+    if rc != 0:
+        sys.exit(rc)
+
+
+@main.command("run")
+@click.option(
+    "--limit",
+    type=int,
+    default=DEFAULT_ONESHOT_LIMIT,
+    show_default=True,
+    help="Maximum number of unread inbox messages to scan in one pass.",
+)
+@click.option(
+    "--json",
+    "output_json",
+    is_flag=True,
+    default=False,
+    help="Emit the result as JSON instead of a human summary.",
+)
+@click.option(
+    "--no-archive",
+    "no_archive",
+    is_flag=True,
+    default=False,
+    help="Label all four categories but skip the archive phase.",
+)
+@click.option(
+    "--headless",
+    "headless",
+    is_flag=True,
+    default=False,
+    help=(
+        "Fail with auth_required instead of opening the browser if the "
+        "stored token is expired/invalid. Used by the M2 trigger service."
+    ),
+)
+def run_cmd(limit: int, output_json: bool, no_archive: bool, headless: bool) -> None:
+    """One-pass: classify → label all 4 categories → archive all 4.
+
+    The non-interactive, scriptable counterpart of menu option 8. Uses a
+    single inbox snapshot for all four categories so the four label runs
+    operate on the same message set (no drift between them). Exit codes:
+    0 success, 2 bad input / missing API key / auth_required, 4 partial
+    failure, 5 total failure.
+    """
+    try:
+        rc = _run_one_pass(
+            limit=limit,
+            archive=not no_archive,
+            output_json=output_json,
+            interactive_auth=not headless,
+        )
     except KeyboardInterrupt:
         click.echo("\nCancelled.", err=True)
         sys.exit(130)

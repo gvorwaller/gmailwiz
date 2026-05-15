@@ -137,6 +137,117 @@ def test_save_token_uses_pid_and_uuid_in_tmp_name(tmp_path, monkeypatch):
     )
 
 
+def test_get_credentials_headless_raises_when_token_missing(tmp_path, monkeypatch):
+    """Headless mode: missing token.json must raise AuthRequired and never invoke the flow."""
+    monkeypatch.setattr(gw_auth, "DEFAULT_TOKEN_PATH", tmp_path / "absent" / "token.json")
+
+    def _flow_should_not_run(_path):
+        raise AssertionError("interactive flow must not run when interactive=False")
+
+    monkeypatch.setattr(gw_auth, "_run_flow", _flow_should_not_run)
+    with pytest.raises(gw_auth.AuthRequired) as exc_info:
+        gw_auth.get_credentials(interactive=False)
+    assert "no token" in exc_info.value.reason
+
+
+def test_get_credentials_headless_raises_on_refresh_failure(tmp_path, monkeypatch):
+    """Expired token + refresh failure in headless mode → AuthRequired, no flow."""
+    token_path = tmp_path / "token.json"
+
+    fake_creds = MagicMock()
+    fake_creds.valid = False
+    fake_creds.expired = True
+    fake_creds.refresh_token = "rt"
+
+    def _boom(_request):
+        raise RuntimeError("refresh token expired")
+
+    fake_creds.refresh.side_effect = _boom
+
+    monkeypatch.setattr(gw_auth, "_load_token", lambda _p: fake_creds)
+    monkeypatch.setattr(gw_auth, "_save_token", lambda _c, _p: None)
+    monkeypatch.setattr(
+        gw_auth,
+        "_run_flow",
+        lambda _p: (_ for _ in ()).throw(AssertionError("flow must not run")),
+    )
+
+    with pytest.raises(gw_auth.AuthRequired) as exc_info:
+        gw_auth.get_credentials(token_path=token_path, interactive=False)
+    assert "refresh failed" in exc_info.value.reason
+
+
+def test_get_credentials_headless_raises_when_no_refresh_token(tmp_path, monkeypatch):
+    """A token without a refresh_token can't be refreshed — must raise in headless mode."""
+    token_path = tmp_path / "token.json"
+
+    fake_creds = MagicMock()
+    fake_creds.valid = False
+    fake_creds.expired = True
+    fake_creds.refresh_token = None  # no refresh_token
+
+    monkeypatch.setattr(gw_auth, "_load_token", lambda _p: fake_creds)
+    monkeypatch.setattr(
+        gw_auth,
+        "_run_flow",
+        lambda _p: (_ for _ in ()).throw(AssertionError("flow must not run")),
+    )
+
+    with pytest.raises(gw_auth.AuthRequired) as exc_info:
+        gw_auth.get_credentials(token_path=token_path, interactive=False)
+    assert "refresh_token" in exc_info.value.reason
+
+
+def test_get_credentials_headless_returns_valid_creds(tmp_path, monkeypatch):
+    """Sanity: a valid stored token returns successfully even in headless mode."""
+    fake_creds = MagicMock()
+    fake_creds.valid = True
+    fake_creds.expired = False
+
+    monkeypatch.setattr(gw_auth, "_load_token", lambda _p: fake_creds)
+    monkeypatch.setattr(
+        gw_auth,
+        "_run_flow",
+        lambda _p: (_ for _ in ()).throw(AssertionError("flow must not run")),
+    )
+
+    got = gw_auth.get_credentials(token_path=tmp_path / "t.json", interactive=False)
+    assert got is fake_creds
+
+
+def test_get_credentials_headless_refreshes_expired_token(tmp_path, monkeypatch):
+    """Expired + refresh succeeds in headless mode: returns the refreshed creds."""
+    fake_creds = MagicMock()
+    fake_creds.valid = False
+    fake_creds.expired = True
+    fake_creds.refresh_token = "rt"
+    fake_creds.refresh = MagicMock(return_value=None)
+
+    monkeypatch.setattr(gw_auth, "_load_token", lambda _p: fake_creds)
+    saved = {}
+    monkeypatch.setattr(gw_auth, "_save_token", lambda c, p: saved.setdefault("ok", True))
+    monkeypatch.setattr(
+        gw_auth,
+        "_run_flow",
+        lambda _p: (_ for _ in ()).throw(AssertionError("flow must not run")),
+    )
+
+    got = gw_auth.get_credentials(token_path=tmp_path / "t.json", interactive=False)
+    assert got is fake_creds
+    assert fake_creds.refresh.called
+    assert saved == {"ok": True}
+
+
+def test_get_credentials_force_reauth_headless_is_rejected(tmp_path):
+    """force_reauth=True + interactive=False is a contradiction — must raise immediately."""
+    with pytest.raises(gw_auth.AuthRequired):
+        gw_auth.get_credentials(
+            token_path=tmp_path / "t.json",
+            force_reauth=True,
+            interactive=False,
+        )
+
+
 def test_save_token_succeeds_with_pre_fix_pid_only_orphan(tmp_path):
     """Regression guard for the uuid-suffix fix. Plants a tmp file at the
     EXACT path the pre-fix (PID-only) code would have created. Pre-fix,

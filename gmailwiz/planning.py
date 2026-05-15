@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from google.oauth2.credentials import Credentials
 
@@ -237,6 +237,7 @@ def build_label_plan(
     category: Category,
     limit: int = 100,
     query: str = "is:unread in:inbox",
+    messages: Optional[Sequence[dict]] = None,
 ) -> LabelPlan:
     """Build a labeling plan for ``category`` from the current inbox state.
 
@@ -252,6 +253,13 @@ def build_label_plan(
       * messages that already carry the target ``gmailwiz/<category>`` label
 
     Does **not** mutate Gmail. Label creation is deferred to commit time.
+
+    Snapshot mode (``messages=...``): the caller supplies a pre-fetched list
+    of message metadata dicts (same shape as ``get_message_metadata``
+    returns). This is the path ``oneshot.run_one_pass`` uses to run all four
+    categories against a single fixed message set: without it, ``build_*_plan``
+    would refetch the inbox between categories and category N+1 would see a
+    different inbox than category N.
     """
     if category not in CLASSIFIABLE_CATEGORIES:
         raise ValueError(
@@ -268,14 +276,21 @@ def build_label_plan(
     existing_labels = gmail_client.list_existing_labels(creds)
     target_label_id: Optional[str] = existing_labels.get(label_name)
 
-    ids = gmail_client.list_unread_message_ids(creds, max_results=limit, query=query)
-    messages = gmail_client.get_message_metadata(creds, ids) if ids else []
-    # Per-message HttpErrors inside `get_message_metadata` are logged to
-    # stderr and the message is skipped (active inbox: messages can be
-    # archived/deleted between list and get). Compute the gap so the
-    # preview can surface it — a transient API issue could otherwise
-    # silently shrink the candidate set without any user-visible signal.
-    fetch_failure_count = max(0, len(ids) - len(messages))
+    if messages is None:
+        ids = gmail_client.list_unread_message_ids(creds, max_results=limit, query=query)
+        fetched = gmail_client.get_message_metadata(creds, ids) if ids else []
+        # Per-message HttpErrors inside `get_message_metadata` are logged to
+        # stderr and the message is skipped (active inbox: messages can be
+        # archived/deleted between list and get). Compute the gap so the
+        # preview can surface it — a transient API issue could otherwise
+        # silently shrink the candidate set without any user-visible signal.
+        fetch_failure_count = max(0, len(ids) - len(fetched))
+        messages = fetched
+    else:
+        # Snapshot mode: caller is responsible for the message set. No
+        # refetch, so no fetch failures.
+        messages = list(messages)
+        fetch_failure_count = 0
 
     # Persist the run row before iterating, so a crash mid-plan still leaves
     # a discoverable record (the user sees a `planned` run with N audit rows
@@ -696,6 +711,7 @@ def build_archive_plan(
     creds: Credentials,
     conn: sqlite3.Connection,
     source_run_id: str,
+    messages: Optional[Mapping[str, dict]] = None,
 ) -> ArchivePlan:
     """Build an archive plan from a previously-applied label run.
 
@@ -748,12 +764,18 @@ def build_archive_plan(
     )
 
     message_ids = [r["message_id"] for r in applied_source_rows]
-    messages = (
-        gmail_client.get_message_metadata(creds, message_ids)
-        if message_ids
-        else []
-    )
-    fetch_failure_count = max(0, len(message_ids) - len(messages))
+    if messages is None:
+        msgs_list = (
+            gmail_client.get_message_metadata(creds, message_ids)
+            if message_ids
+            else []
+        )
+    else:
+        # Snapshot mode: pull each applied row's metadata out of the
+        # caller-provided mapping. Ids not in the snapshot count as
+        # "fetch failures" since we can't project their post-label state.
+        msgs_list = [messages[mid] for mid in message_ids if mid in messages]
+    fetch_failure_count = max(0, len(message_ids) - len(msgs_list))
 
     run_id = gw_db.create_run(
         conn,
@@ -769,12 +791,12 @@ def build_archive_plan(
         run_id=run_id,
         source_run_id=source_run_id,
         source_category=source_category,
-        fetched_message_count=len(messages),
+        fetched_message_count=len(msgs_list),
         fetch_failure_count=fetch_failure_count,
         skipped_source_failed=skipped_source_failed,
     )
 
-    for msg in messages:
+    for msg in msgs_list:
         before_ids = list(msg.get("label_ids") or [])
         if INBOX_LABEL_ID not in before_ids:
             # User already archived this one manually. Don't re-archive

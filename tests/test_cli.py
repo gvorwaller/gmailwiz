@@ -79,9 +79,10 @@ def test_label_subcommand_help_lists_phase2_flags():
 
 def test_menu_text_full_phase_options():
     """All phases shipped: 1 (report), 2/3 (label preview/apply),
-    4 (undo any), 5 (re-auth), 6/7 (archive preview/apply), q (quit)."""
+    4 (undo any), 5 (re-auth), 6/7 (archive preview/apply),
+    8 (run full cycle one-pass), q (quit)."""
     keys = {opt.key for opt in MENU_OPTIONS}
-    assert keys == {"1", "2", "3", "4", "5", "6", "7", "q"}
+    assert keys == {"1", "2", "3", "4", "5", "6", "7", "8", "q"}
 
 
 def test_render_menu_contains_header_and_all_options():

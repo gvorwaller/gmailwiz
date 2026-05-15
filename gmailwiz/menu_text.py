@@ -8,6 +8,7 @@ All phases shipped:
   5 — re-authenticate
   6 — preview archive run
   7 — apply previewed archive run
+  8 — run full cycle (report → label all → archive all, one shot)
   q — quit
 """
 
@@ -115,6 +116,21 @@ MENU_OPTIONS: tuple[MenuOption, ...] = (
             "one and confirm with 'yes' to remove INBOX from every message "
             "in that plan. The messages disappear from your Inbox view but "
             "remain in All Mail. Reversible via menu option 4."
+        ),
+    ),
+    MenuOption(
+        key="8",
+        label="Run full cycle",
+        summary="Report → label all 4 categories → archive all 4. No per-category prompts.",
+        detail=(
+            "Captures a snapshot of your unread inbox, classifies senders "
+            "with Claude, then labels and archives all four categories "
+            "(promotional, transactional, newsletter, personal) in one go. "
+            "The same code path the Drafts → M2 trigger service will use. "
+            "You'll be asked for the message limit (default 1000), then "
+            "the run proceeds without further prompts. Each category writes "
+            "its own label run + archive run to the audit log, so any of "
+            "them can be undone individually via option 4."
         ),
     ),
     MenuOption(

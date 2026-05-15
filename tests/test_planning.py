@@ -1412,3 +1412,129 @@ def test_apply_undo_label_missing_label_in_gmail_errors(monkeypatch, conn):
         planning.apply_undo_plan(
             creds=MagicMock(), conn=conn, run_id=label_run_id
         )
+
+
+# ---------------------------------------------------------------------------
+# Snapshot mode — `messages=...` skips the Gmail refetch entirely
+# (Used by `oneshot.run_one_pass` to keep all four categories on a single
+# fixed inbox set.)
+# ---------------------------------------------------------------------------
+
+
+def test_build_label_plan_snapshot_skips_gmail_calls(monkeypatch, conn):
+    """When ``messages=`` is passed, neither list_unread_message_ids nor
+    get_message_metadata may be called. This is the load-bearing invariant
+    that lets oneshot pin all four categories to a single inbox snapshot."""
+    _seed_sender(conn, email="promo@x.com", category=Category.PROMOTIONAL)
+
+    def _boom_list(*_a, **_k):
+        raise AssertionError("list_unread_message_ids must not be called in snapshot mode")
+
+    def _boom_get(*_a, **_k):
+        raise AssertionError("get_message_metadata must not be called in snapshot mode")
+
+    monkeypatch.setattr(gmail_client, "list_unread_message_ids", _boom_list)
+    monkeypatch.setattr(gmail_client, "get_message_metadata", _boom_get)
+    monkeypatch.setattr(gmail_client, "list_existing_labels", lambda creds: {})
+
+    snapshot = [_msg(mid="m1", sender="promo@x.com")]
+    plan = planning.build_label_plan(
+        creds=MagicMock(),
+        conn=conn,
+        category=Category.PROMOTIONAL,
+        limit=10,
+        messages=snapshot,
+    )
+    assert [c.message_id for c in plan.candidates] == ["m1"]
+    assert plan.fetch_failure_count == 0
+
+
+def test_build_label_plan_snapshot_stable_across_mutation(monkeypatch, conn):
+    """The whole point of snapshot mode: even if Gmail state changes
+    between calls, the snapshot-driven plans operate on the original set."""
+    _seed_sender(conn, email="promo@x.com", category=Category.PROMOTIONAL)
+    monkeypatch.setattr(gmail_client, "list_existing_labels", lambda creds: {})
+
+    snapshot = [
+        _msg(mid="m1", sender="promo@x.com"),
+        _msg(mid="m2", sender="promo@x.com"),
+    ]
+
+    # Pretend the live inbox now only has m1 (m2 was archived between calls).
+    monkeypatch.setattr(
+        gmail_client, "list_unread_message_ids",
+        lambda creds, max_results=100, query="is:unread in:inbox": ["m1"],
+    )
+    monkeypatch.setattr(
+        gmail_client, "get_message_metadata",
+        lambda creds, message_ids: [_msg(mid="m1", sender="promo@x.com")],
+    )
+
+    plan = planning.build_label_plan(
+        creds=MagicMock(),
+        conn=conn,
+        category=Category.PROMOTIONAL,
+        limit=10,
+        messages=snapshot,
+    )
+    # Snapshot still has m1 AND m2 even though live inbox shrunk.
+    assert sorted(c.message_id for c in plan.candidates) == ["m1", "m2"]
+
+
+def test_build_label_plan_snapshot_none_preserves_legacy_behavior(monkeypatch, conn):
+    """Regression guard: messages=None must still drive the live Gmail
+    fetch path (i.e. the existing CLI subcommands keep working)."""
+    _seed_sender(conn, email="promo@x.com", category=Category.PROMOTIONAL)
+    msgs = [_msg(mid="m1", sender="promo@x.com")]
+    _stub_gmail(monkeypatch, ids=["m1"], messages=msgs)
+    plan = planning.build_label_plan(
+        creds=MagicMock(), conn=conn, category=Category.PROMOTIONAL, limit=5,
+        # messages=None (default)
+    )
+    assert [c.message_id for c in plan.candidates] == ["m1"]
+
+
+def test_build_archive_plan_snapshot_skips_gmail_calls(monkeypatch, conn):
+    """Archive snapshot mode: caller supplies a mapping id → metadata,
+    `get_message_metadata` must not be called."""
+    label_run_id = _commit_label_run(monkeypatch, conn, mids=["m1", "m2"])
+
+    def _boom_get(*_a, **_k):
+        raise AssertionError("get_message_metadata must not be called in archive snapshot mode")
+
+    monkeypatch.setattr(gmail_client, "get_message_metadata", _boom_get)
+
+    snapshot = {
+        "m1": _msg(mid="m1", sender="m1@x.com", label_ids=["INBOX", "UNREAD", "Label_99"]),
+        "m2": _msg(mid="m2", sender="m2@x.com", label_ids=["INBOX", "UNREAD", "Label_99"]),
+    }
+    plan = planning.build_archive_plan(
+        creds=MagicMock(),
+        conn=conn,
+        source_run_id=label_run_id,
+        messages=snapshot,
+    )
+    assert sorted(c.message_id for c in plan.candidates) == ["m1", "m2"]
+
+
+def test_build_archive_plan_snapshot_missing_id_counts_as_fetch_failure(monkeypatch, conn):
+    """An applied source id absent from the snapshot mapping is treated as
+    a fetch failure — same outcome as the live-fetch path would record."""
+    label_run_id = _commit_label_run(monkeypatch, conn, mids=["m1", "m2"])
+    monkeypatch.setattr(
+        gmail_client, "get_message_metadata",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not fetch")),
+    )
+
+    snapshot = {
+        "m1": _msg(mid="m1", sender="m1@x.com", label_ids=["INBOX", "UNREAD", "Label_99"]),
+        # m2 deliberately absent
+    }
+    plan = planning.build_archive_plan(
+        creds=MagicMock(),
+        conn=conn,
+        source_run_id=label_run_id,
+        messages=snapshot,
+    )
+    assert [c.message_id for c in plan.candidates] == ["m1"]
+    assert plan.fetch_failure_count == 1
