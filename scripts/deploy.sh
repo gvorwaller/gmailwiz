@@ -1,19 +1,31 @@
 #!/usr/bin/env bash
-# deploy.sh — push the current local HEAD to M2 (~/gmailwiz) via git pull.
+# deploy.sh — push the current local HEAD to M2 (~/gmailwiz) via git pull,
+# then restart the trigger service and verify it's healthy on the public
+# hostname before exiting.
 #
 # Strict-by-design: refuses to deploy a dirty working tree and refuses to
 # deploy a HEAD that isn't already on origin/main. M2 runs `git pull
 # --ff-only`, then we cross-check that the remote SHA matches our local
-# SHA, install dep changes if requirements.txt moved, and smoke `python
-# -m gmailwiz --help`.
+# SHA, install dep changes if requirements.txt moved, smoke `python -m
+# gmailwiz --help` on the remote, kick the launchd unit, and poll the
+# public /health + /ready endpoints to confirm the new code is serving.
 #
-# Phase 1 ship: code sync + smoke only. Phase 2 will extend this to kick
-# the launchd unit and curl `/ready` on the trigger service.
+# Exit codes:
+#   0  full success (service running, /health 200, /ready 200)
+#   0  service running and /health 200, but /ready 503 (token expired or
+#      similar operational issue — DEPLOY is not the cause; warning printed)
+#   1  any pre-deploy guard fails (dirty tree, unpushed HEAD, etc.)
+#   2  remote git/pip/smoke failed
+#   3  service didn't come back up after kickstart (deploy DID land code,
+#      but the daemon is unhealthy)
 
 set -euo pipefail
 
 REMOTE_HOST="${REMOTE_HOST:-Mprd}"
 REMOTE_PATH="${REMOTE_PATH:-\$HOME/gmailwiz}"
+PUBLIC_BASE="${PUBLIC_BASE:-https://gmailwiz.gaylon.photos}"
+LAUNCHD_LABEL="${LAUNCHD_LABEL:-com.gmailwiz.trigger}"
+HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-30}"
 LOCAL_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 log()   { printf '\033[1;34m[deploy]\033[0m %s\n' "$*"; }
@@ -124,13 +136,82 @@ fi
 # ---------------------------------------------------------------------------
 log "Smoke-testing remote import (python -m gmailwiz --help)..."
 if ! ssh "${REMOTE_HOST}" "cd ${REMOTE_PATH} && .venv/bin/python -m gmailwiz --help >/dev/null"; then
-  fail "python -m gmailwiz --help failed on ${REMOTE_HOST}. Check the venv + dependencies."
+  err "python -m gmailwiz --help failed on ${REMOTE_HOST}. Check the venv + dependencies."
+  exit 2
 fi
 log "  --help smoke OK ✓"
+
+# ---------------------------------------------------------------------------
+# 8. Kick the launchd unit so the daemon picks up the new code.
+#    `launchctl kickstart -k` stops the running process and re-launches it
+#    using the existing service definition. The unit's KeepAlive=true means
+#    it would restart itself eventually if it crashed; kickstart makes it
+#    happen synchronously and right now.
+# ---------------------------------------------------------------------------
+log "Kicking launchd unit (${LAUNCHD_LABEL})..."
+# `kickstart -k` succeeds silently with no output; on failure (unknown
+# label etc.) it prints "Could not find service ..." and exits non-zero.
+# The subsequent /health poll catches any silent failure regardless.
+if ! ssh "${REMOTE_HOST}" "launchctl kickstart -k gui/\$(id -u)/${LAUNCHD_LABEL}"; then
+  err "launchctl kickstart failed. Is ${LAUNCHD_LABEL} bootstrapped on ${REMOTE_HOST}?"
+  err "  Check: ssh ${REMOTE_HOST} 'launchctl print gui/\$(id -u)/${LAUNCHD_LABEL}'"
+  exit 3
+fi
+log "  kickstart issued ✓"
+
+# ---------------------------------------------------------------------------
+# 9. Verify /health on the public hostname.
+#    Poll until 200 or HEALTH_TIMEOUT_SECONDS elapses. The unit takes a
+#    second or two to start uvicorn after kickstart; CloudFlare may add
+#    another beat. 30s default is plenty of headroom.
+# ---------------------------------------------------------------------------
+log "Verifying /health at ${PUBLIC_BASE} ..."
+deadline=$(( $(date +%s) + HEALTH_TIMEOUT_SECONDS ))
+last_code="?"
+while [[ $(date +%s) -lt ${deadline} ]]; do
+  code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 5 "${PUBLIC_BASE}/health" || echo "000")
+  last_code="${code}"
+  if [[ "${code}" == "200" ]]; then
+    break
+  fi
+  sleep 1
+done
+if [[ "${last_code}" != "200" ]]; then
+  err "/health did not return 200 within ${HEALTH_TIMEOUT_SECONDS}s (last=${last_code})."
+  err "  Code is on disk at the right SHA, but the service is not serving."
+  err "  Check on ${REMOTE_HOST}:  tail -50 ~/logs/gmailwiz-trigger/err.log"
+  exit 3
+fi
+log "  /health 200 ✓"
+
+# ---------------------------------------------------------------------------
+# 10. Verify /ready. 200 == fully operational. 503 == service is up but
+#     operationally degraded (e.g. token expired) — that's NOT a deploy
+#     failure; we warn and exit 0 so the operator can re-auth at leisure.
+# ---------------------------------------------------------------------------
+log "Verifying /ready at ${PUBLIC_BASE} ..."
+ready_body=$(mktemp)
+ready_code=$(curl -sS -o "${ready_body}" -w "%{http_code}" --max-time 10 "${PUBLIC_BASE}/ready" || echo "000")
+if [[ "${ready_code}" == "200" ]]; then
+  log "  /ready 200 ✓ (all preflight checks pass)"
+  rm -f "${ready_body}"
+elif [[ "${ready_code}" == "503" ]]; then
+  warn "/ready returned 503 — service is running but not fully ready."
+  warn "  This is independent of the deploy. Failing checks:"
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '.checks | to_entries[] | select(.value.ok == false) | "    - \(.key): \(.value.reason // "no reason given")"' < "${ready_body}" >&2 || cat "${ready_body}" >&2
+  else
+    cat "${ready_body}" >&2
+  fi
+  rm -f "${ready_body}"
+else
+  err "/ready returned HTTP ${ready_code} (expected 200 or 503)."
+  cat "${ready_body}" >&2
+  rm -f "${ready_body}"
+  exit 3
+fi
 
 log ""
 log "Deploy complete."
 log "  ${REMOTE_HOST}:${REMOTE_PATH} now at ${LOCAL_SHA:0:12}"
-log ""
-log "Suggested follow-up:"
-log "  ssh ${REMOTE_HOST} '.venv/bin/python -m gmailwiz run --limit 10 --json --headless' | jq"
+log "  Trigger service kicked + verified at ${PUBLIC_BASE}"
